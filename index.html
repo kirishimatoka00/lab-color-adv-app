@@ -250,7 +250,7 @@
                     }
                 } else {
                     for (let i = 0; i < posAttr.count; i += 3) {
-                         triangle.set(
+                          triangle.set(
                             new THREE.Vector3().fromBufferAttribute(posAttr, i),
                             new THREE.Vector3().fromBufferAttribute(posAttr, i+1),
                             new THREE.Vector3().fromBufferAttribute(posAttr, i+2)
@@ -481,7 +481,8 @@
                         mode === '3d' ? <Billboard position={[0, 6, 0]}><Text fontSize={3} color={isTestPoint ? "#d8b4fe" : "white"} outlineWidth={0.15} outlineColor="black" anchorY="bottom">{labelText}</Text></Billboard> 
                         : <Text position={[0, 6, 0]} fontSize={3} color={isTestPoint ? "#581c87" : "#1e293b"} outlineWidth={0.2} outlineColor="white" anchorY="bottom">{labelText}</Text>
                     )}
-                    <Html distanceFactor={200} zIndexRange={[100, 0]} style={{ pointerEvents: 'none', opacity: hovered ? 1 : 0, transition: 'opacity 0.2s' }}>
+                    {/* Fixed: Conditional distanceFactor logic to prevent huge scaling in 2D/Orthographic view */}
+                    <Html distanceFactor={mode === '2d' ? undefined : 200} zIndexRange={[100, 0]} style={{ pointerEvents: 'none', opacity: hovered ? 1 : 0, transition: 'opacity 0.2s' }}>
                         <div className={`tooltip-animate px-2 py-1 rounded text-xs whitespace-nowrap border shadow-xl transform -translate-x-1/2 -translate-y-full mt-[-10px] ${isTestPoint ? 'bg-purple-900 text-white border-purple-500' : 'bg-gray-800 text-white border-gray-600'}`}>
                             <strong>{name || defaultLabel} {isStandard ? "(Standard)" : ""}</strong><br/>L:{l} a:{a} b:{b}<br/>{deltaE && <span className="text-yellow-300">ΔE: {deltaE}</span>}
                         </div>
@@ -949,4 +950,4 @@
         const root = createRoot(document.getElementById('root')); root.render(<App />);
     </script>
 </body>
-</html>"
+</html>
