@@ -65,7 +65,7 @@
         import { OrbitControls, MapControls, Text, Html, Billboard } from '@react-three/drei';
         import * as THREE from 'three';
         import { ConvexGeometry } from 'three/examples/jsm/geometries/ConvexGeometry';
-        import { Plus, Trash2, RotateCcw, Info, Box, Camera, Maximize, Minimize, Tag, Eye, EyeOff, LayoutTemplate, Square, Circle, Target, X, Aperture, Upload, Image as ImageIcon, CornerRightDown, FileSpreadsheet, Download, CheckSquare as CheckSquareIcon } from 'lucide-react';
+        import { Plus, Trash2, RotateCcw, Info, Box, Camera, Maximize, Minimize, Tag, Eye, EyeOff, LayoutTemplate, Square, Circle, Target, X, Aperture, Upload, Image as ImageIcon, CornerRightDown, FileSpreadsheet, Download, CheckSquare as CheckSquareIcon, SlidersHorizontal, Sun, Droplet } from 'lucide-react';
 
         /**
          * Math & Color Utility Functions
@@ -491,7 +491,7 @@
             );
         };
 
-        const GamutVolume = ({ points, mode = '3d' }) => {
+        const GamutVolume = ({ points, mode = '3d', colorL = 50, autoL = true, opacity = 0.6 }) => {
             const { geometry } = useMemo(() => {
                 if (points.length < 3) return { geometry: null };
                 const vectors = [];
@@ -522,15 +522,136 @@
                             else d = (p.a - x)**2 + (p.l - y)**2 + (p.b - z)**2;
                             if(d < minD) { minD = d; closest = p; }
                         }
-                        const rgb = ColorUtils.labToRgbNormalized(closest.l, closest.a, closest.b);
+                        // L value used for gamut surface coloring: either each facet's own nearest-point L (auto),
+                        // or a single user-adjustable L value applied uniformly (manual).
+                        const useL = autoL ? closest.l : colorL;
+                        const rgb = ColorUtils.labToRgbNormalized(useL, closest.a, closest.b);
                         colors.push(rgb[0], rgb[1], rgb[2]);
                     }
                     geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
                 } catch (e) { return { geometry: null }; }
                 return { geometry: geo };
-            }, [points, mode]);
+            }, [points, mode, autoL, colorL]);
             if (!geometry) return null;
-            return <group><mesh geometry={geometry}><meshBasicMaterial vertexColors={true} transparent={true} opacity={0.6} side={THREE.DoubleSide} depthWrite={false} /></mesh></group>;
+            return <group><mesh geometry={geometry}><meshBasicMaterial vertexColors={true} transparent={true} opacity={opacity} side={THREE.DoubleSide} depthWrite={false} /></mesh></group>;
+        };
+
+        /**
+         * Draggable slider control (pointer-drag adjustable), used for Gamut L / Opacity controls.
+         */
+        const DragSlider = ({ label, value, min, max, step = 1, onChange, unit = '', accent = '#3b82f6', disabled = false, formatValue }) => {
+            const trackRef = useRef(null);
+            const draggingRef = useRef(false);
+
+            const pct = ColorUtils.clamp((value - min) / (max - min), 0, 1) * 100;
+
+            const updateFromClientX = (clientX) => {
+                if (!trackRef.current) return;
+                const rect = trackRef.current.getBoundingClientRect();
+                const ratio = ColorUtils.clamp((clientX - rect.left) / rect.width, 0, 1);
+                let raw = min + ratio * (max - min);
+                raw = Math.round(raw / step) * step;
+                raw = ColorUtils.clamp(raw, min, max);
+                onChange(parseFloat(raw.toFixed(4)));
+            };
+
+            const handlePointerDown = (e) => {
+                if (disabled) return;
+                draggingRef.current = true;
+                e.currentTarget.setPointerCapture && e.currentTarget.setPointerCapture(e.pointerId);
+                updateFromClientX(e.clientX);
+            };
+            const handlePointerMove = (e) => {
+                if (!draggingRef.current || disabled) return;
+                updateFromClientX(e.clientX);
+            };
+            const handlePointerUp = (e) => {
+                draggingRef.current = false;
+                e.currentTarget.releasePointerCapture && e.currentTarget.releasePointerCapture(e.pointerId);
+            };
+
+            return (
+                <div className={`select-none transition-opacity ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}>
+                    <div className="flex justify-between items-center mb-1.5">
+                        <span className="text-[11px] font-bold text-white/70 uppercase tracking-wider">{label}</span>
+                        <span className="text-xs font-mono font-bold text-white bg-white/10 px-1.5 py-0.5 rounded">{formatValue ? formatValue(value) : value}{unit}</span>
+                    </div>
+                    <div
+                        ref={trackRef}
+                        onPointerDown={handlePointerDown}
+                        onPointerMove={handlePointerMove}
+                        onPointerUp={handlePointerUp}
+                        className={`relative h-5 flex items-center touch-none ${disabled ? 'pointer-events-none cursor-not-allowed' : 'cursor-pointer'}`}
+                        style={{ touchAction: 'none' }}
+                    >
+                        <div className="absolute left-0 right-0 h-1.5 rounded-full bg-white/15" />
+                        <div className="absolute left-0 h-1.5 rounded-full" style={{ width: `${pct}%`, backgroundColor: disabled ? '#6b7280' : accent }} />
+                        <div
+                            className="absolute w-4 h-4 rounded-full shadow-lg border-2 border-white -translate-x-1/2"
+                            style={{ left: `${pct}%`, backgroundColor: disabled ? '#6b7280' : accent }}
+                        />
+                    </div>
+                </div>
+            );
+        };
+
+        const ToggleSwitch = ({ checked, onChange, disabled = false }) => (
+            <button
+                type="button"
+                role="switch"
+                aria-checked={checked}
+                disabled={disabled}
+                onClick={() => !disabled && onChange(!checked)}
+                className={`relative inline-flex items-center w-9 h-5 rounded-full shrink-0 transition-colors duration-200 ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'} ${checked ? 'bg-blue-600' : 'bg-white/20'}`}
+            >
+                <span
+                    className={`absolute left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform duration-200 ${checked ? 'translate-x-4' : 'translate-x-0'}`}
+                />
+            </button>
+        );
+
+        const GamutDisplayPanel = ({ open, onClose, autoL, setAutoL, colorL, setColorL, opacity, setOpacity }) => {
+            if (!open) return null;
+            return (
+                <div className="absolute top-14 right-4 z-30 w-64 bg-[#26262e]/95 backdrop-blur-md border border-white/10 rounded-xl shadow-2xl p-4 space-y-4 tooltip-animate">
+                    <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                        <div className="flex items-center gap-2 text-white text-xs font-bold uppercase tracking-wider"><SlidersHorizontal size={14} /> Gamut Display</div>
+                        <button onClick={onClose} className="text-white/40 hover:text-white transition-colors"><X size={16} /></button>
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-bold text-white/70 uppercase tracking-wider flex items-center gap-1.5"><Sun size={12}/> Auto L (per-facet)</span>
+                        <ToggleSwitch checked={autoL} onChange={setAutoL} />
+                    </div>
+
+                    <DragSlider
+                        label="Gamut Color L"
+                        value={colorL}
+                        min={0}
+                        max={100}
+                        step={1}
+                        onChange={setColorL}
+                        accent="#f59e0b"
+                        disabled={autoL}
+                    />
+
+                    <DragSlider
+                        label="Opacity"
+                        value={opacity}
+                        min={0.05}
+                        max={1}
+                        step={0.01}
+                        onChange={setOpacity}
+                        accent="#22c55e"
+                        formatValue={(v) => Math.round(v * 100)}
+                        unit="%"
+                    />
+
+                    <p className="text-[10px] text-white/40 leading-relaxed pt-1 border-t border-white/10">
+                        {autoL ? 'Each gamut facet is colored using its own nearest point\u2019s L value.' : 'A fixed L value is applied across the whole gamut surface color.'}
+                    </p>
+                </div>
+            );
         };
 
         const ViewContainer = ({ children, title, onFullscreen, onCapture, onToggleLabels, showLabels }) => {
@@ -573,7 +694,7 @@
             return null;
         };
 
-        const Scene3D = ({ basePoints, historyPoints, testPoints, captureRef, showLabels }) => {
+        const Scene3D = ({ basePoints, historyPoints, testPoints, captureRef, showLabels, gamutColorL, gamutAutoL, gamutOpacity }) => {
             const gamutPoints = useMemo(() => [...basePoints.filter(p=>p.visible!==false), ...historyPoints.filter(p=>p.visible!==false)], [basePoints, historyPoints]);
             const renderBase = useMemo(() => basePoints.filter(p => p.showPoint !== false), [basePoints]);
             const renderHistory = useMemo(() => historyPoints.filter(p => p.showPoint !== false), [historyPoints]);
@@ -589,12 +710,12 @@
                     {renderBase.map((p) => <LabPoint key={p.id} {...p} mode="3d" showLabels={showLabels} typeLabel="Base" />)}
                     {renderHistory.map((p) => <LabPoint key={p.id} {...p} mode="3d" showLabels={showLabels} typeLabel="Hist" />)}
                     {renderTest.map((p) => <LabPoint key={p.id} {...p} mode="3d" isTestPoint={true} showLabels={showLabels} />)}
-                    <GamutVolume points={gamutPoints} mode="3d" />
+                    <GamutVolume points={gamutPoints} mode="3d" colorL={gamutColorL} autoL={gamutAutoL} opacity={gamutOpacity} />
                 </>
             );
         };
 
-        const Scene2D = ({ basePoints, historyPoints, testPoints, captureRef, showLabels }) => {
+        const Scene2D = ({ basePoints, historyPoints, testPoints, captureRef, showLabels, gamutColorL, gamutAutoL, gamutOpacity }) => {
             const gamutPoints = useMemo(() => [...basePoints.filter(p=>p.visible!==false), ...historyPoints.filter(p=>p.visible!==false)], [basePoints, historyPoints]);
             const renderBase = useMemo(() => basePoints.filter(p => p.showPoint !== false), [basePoints]);
             const renderHistory = useMemo(() => historyPoints.filter(p => p.showPoint !== false), [historyPoints]);
@@ -609,7 +730,7 @@
                     {renderBase.map((p) => <LabPoint key={p.id} {...p} mode="2d" showLabels={showLabels} typeLabel="Base" />)}
                     {renderHistory.map((p) => <LabPoint key={p.id} {...p} mode="2d" showLabels={showLabels} typeLabel="Hist" />)}
                     {renderTest.map((p) => <LabPoint key={p.id} {...p} mode="2d" isTestPoint={true} showLabels={showLabels} />)}
-                    <GamutVolume points={gamutPoints} mode="2d" />
+                    <GamutVolume points={gamutPoints} mode="2d" colorL={gamutColorL} autoL={gamutAutoL} opacity={gamutOpacity} />
                 </>
             );
         };
@@ -622,6 +743,49 @@
                 if (field === 'l') val = ColorUtils.clamp(val, 0, 200); if (field === 'a' || field === 'b') val = ColorUtils.clamp(val, -200, 200);
                 onChange(point.id, field, val);
             };
+
+            // Local text drafts for l/a/b so the user can type a leading "-" (or a trailing ".")
+            // without it being immediately parsed back to 0. Only committed to parent state once
+            // the draft is a complete, valid number.
+            const [drafts, setDrafts] = useState({ l: String(point.l), a: String(point.a), b: String(point.b) });
+            const focusedFieldRef = useRef(null);
+            const NUMERIC_DRAFT_RE = /^-?\d*\.?\d*$/;
+
+            useEffect(() => {
+                setDrafts(prev => ({
+                    l: focusedFieldRef.current === 'l' ? prev.l : String(point.l),
+                    a: focusedFieldRef.current === 'a' ? prev.a : String(point.a),
+                    b: focusedFieldRef.current === 'b' ? prev.b : String(point.b),
+                }));
+                // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, [point.l, point.a, point.b]);
+
+            const handleNumericDraftChange = (field, rawValue) => {
+                // Allow intermediate typing states: "", "-", "-.", "3.", "-3." etc. without committing yet.
+                if (rawValue === '' || rawValue === '-' || NUMERIC_DRAFT_RE.test(rawValue)) {
+                    setDrafts(prev => ({ ...prev, [field]: rawValue }));
+                    // Only push to parent state once it's a complete number (not mid-typing like "-" or "3.")
+                    if (rawValue !== '' && rawValue !== '-' && !rawValue.endsWith('.') && !isNaN(parseFloat(rawValue))) {
+                        handleChange(field, rawValue);
+                    }
+                    return;
+                }
+                // Reject any character that doesn't fit a plain signed decimal number.
+            };
+
+            const handleNumericFocus = (field) => { focusedFieldRef.current = field; };
+            const handleNumericBlur = (field) => {
+                focusedFieldRef.current = null;
+                // Finalize: if what's left isn't a full valid number, snap back to the committed point value.
+                const raw = drafts[field];
+                if (raw === '' || raw === '-' || raw.endsWith('.') || isNaN(parseFloat(raw))) {
+                    setDrafts(prev => ({ ...prev, [field]: String(point[field]) }));
+                } else {
+                    handleChange(field, raw);
+                    setDrafts(prev => ({ ...prev, [field]: String(ColorUtils.clamp(parseFloat(raw), field === 'l' ? 0 : -200, field === 'l' ? 200 : 200)) }));
+                }
+            };
+
             return (
                 <div className={`flex flex-col mb-2 bg-white p-2 rounded-lg shadow-sm border group transition-colors ${isStandard ? 'border-yellow-400 bg-yellow-50' : 'border-gray-100 hover:border-blue-300'}`}>
                     <div className="mb-2 flex items-center border-b border-gray-100 pb-1">
@@ -661,7 +825,15 @@
                             {['l', 'a', 'b'].map(field => (
                                 <div key={field} className="flex flex-col relative">
                                     <label className="absolute -top-1.5 left-1 text-[8px] bg-white px-0.5 text-gray-400 font-bold uppercase tracking-wider pointer-events-none">{field}</label>
-                                    <input type="number" value={point[field]} onChange={(e) => handleChange(field, e.target.value)} className={`w-full text-center text-sm border border-gray-200 rounded py-1 px-0.5 focus:border-blue-500 focus:outline-none transition-all focus:bg-white ${point.visible === false ? 'bg-gray-50 text-gray-500' : 'bg-gray-50'}`} />
+                                    <input
+                                        type="text"
+                                        inputMode="decimal"
+                                        value={drafts[field]}
+                                        onChange={(e) => handleNumericDraftChange(field, e.target.value)}
+                                        onFocus={() => handleNumericFocus(field)}
+                                        onBlur={() => handleNumericBlur(field)}
+                                        className={`w-full text-center text-sm border border-gray-200 rounded py-1 px-0.5 focus:border-blue-500 focus:outline-none transition-all focus:bg-white ${point.visible === false ? 'bg-gray-50 text-gray-500' : 'bg-gray-50'}`}
+                                    />
                                 </div>
                             ))}
                         </div>
@@ -703,6 +875,13 @@
             const [viewMode, setViewMode] = useState('split');
             const [showCamera, setShowCamera] = useState(false);
             const fileInputRef = useRef(null);
+
+            // Gamut surface display settings (color L override + opacity), user-adjustable via drag sliders
+            const [gamutAutoL, setGamutAutoL] = useState(true);
+            const [gamutColorL, setGamutColorL] = useState(() => getInitialData('lab_gamutColorL', 50));
+            const [gamutOpacity, setGamutOpacity] = useState(() => getInitialData('lab_gamutOpacity', 0.6));
+            const [showGamutPanel, setShowGamutPanel] = useState(false);
+            useEffect(() => { window.localStorage.setItem('lab_gamutColorL', JSON.stringify(gamutColorL)); window.localStorage.setItem('lab_gamutOpacity', JSON.stringify(gamutOpacity)); }, [gamutColorL, gamutOpacity]);
             
             // Gamut Calculation Mesh (Memoized)
             const gamutMesh = useMemo(() => {
@@ -932,16 +1111,33 @@
                         </div>
                     </div>
                     <div className="flex-1 relative h-1/2 md:h-full flex flex-col bg-[#1e1e24] overflow-hidden min-w-0">
-                        <div className="flex items-center justify-center p-2 bg-[#1e1e24] border-b border-white/10 shrink-0 z-30">
+                        <div className="relative flex items-center justify-center p-2 bg-[#1e1e24] border-b border-white/10 shrink-0 z-30">
                             <div className="flex bg-black/40 rounded-lg p-1 border border-white/10">
                                 <button onClick={() => setViewMode('3d')} className={`px-4 py-1.5 text-xs font-bold rounded-md transition-all ${viewMode === '3d' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}>3D</button>
                                 <button onClick={() => setViewMode('2d')} className={`px-4 py-1.5 text-xs font-bold rounded-md transition-all ${viewMode === '2d' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}>2D</button>
                                 <button onClick={() => setViewMode('split')} className={`px-4 py-1.5 text-xs font-bold rounded-md transition-all ${viewMode === 'split' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}>Split</button>
                             </div>
+                            <button
+                                onClick={() => setShowGamutPanel(!showGamutPanel)}
+                                className={`absolute right-3 top-1/2 -translate-y-1/2 p-2 rounded-lg border transition-all active:scale-95 ${showGamutPanel ? 'bg-blue-600 text-white border-blue-500' : 'bg-black/40 text-white/70 border-white/10 hover:bg-white/10'}`}
+                                title="Gamut Color / Opacity"
+                            >
+                                <SlidersHorizontal size={16} />
+                            </button>
+                            <GamutDisplayPanel
+                                open={showGamutPanel}
+                                onClose={() => setShowGamutPanel(false)}
+                                autoL={gamutAutoL}
+                                setAutoL={setGamutAutoL}
+                                colorL={gamutColorL}
+                                setColorL={setGamutColorL}
+                                opacity={gamutOpacity}
+                                setOpacity={setGamutOpacity}
+                            />
                         </div>
                         <div className="flex-1 relative flex flex-col">
-                            {(viewMode === '3d' || viewMode === 'split') && <div className={`relative ${viewMode === 'split' ? 'h-1/2 border-b border-white/10' : 'h-full'}`}><ViewContainer title="3D View" onCapture={() => capture3DRef.current && capture3DRef.current()} onToggleLabels={() => setShowLabels(!showLabels)} showLabels={showLabels}><Canvas camera={{ position: [200, 150, 200], fov: 40 }} dpr={[1, 2]}><color attach="background" args={['#1e1e24']} /><Scene3D basePoints={basePoints} historyPoints={historyPoints} testPoints={processedTestPoints} captureRef={capture3DRef} showLabels={showLabels} /></Canvas></ViewContainer></div>}
-                            {(viewMode === '2d' || viewMode === 'split') && <div className={`relative ${viewMode === 'split' ? 'h-1/2' : 'h-full'}`}><ViewContainer title="2D View (a-b)" onCapture={() => capture2DRef.current && capture2DRef.current()} onToggleLabels={() => setShowLabels(!showLabels)} showLabels={showLabels}><Canvas orthographic camera={{ position: [0, 0, 100], zoom: 1.5, near: 0.1, far: 1000 }} dpr={[1, 2]}><color attach="background" args={['#18181b']} /><Scene2D basePoints={basePoints} historyPoints={historyPoints} testPoints={processedTestPoints} captureRef={capture2DRef} showLabels={showLabels} /></Canvas></ViewContainer></div>}
+                            {(viewMode === '3d' || viewMode === 'split') && <div className={`relative ${viewMode === 'split' ? 'h-1/2 border-b border-white/10' : 'h-full'}`}><ViewContainer title="3D View" onCapture={() => capture3DRef.current && capture3DRef.current()} onToggleLabels={() => setShowLabels(!showLabels)} showLabels={showLabels}><Canvas camera={{ position: [200, 150, 200], fov: 40 }} dpr={[1, 2]}><color attach="background" args={['#1e1e24']} /><Scene3D basePoints={basePoints} historyPoints={historyPoints} testPoints={processedTestPoints} captureRef={capture3DRef} showLabels={showLabels} gamutColorL={gamutColorL} gamutAutoL={gamutAutoL} gamutOpacity={gamutOpacity} /></Canvas></ViewContainer></div>}
+                            {(viewMode === '2d' || viewMode === 'split') && <div className={`relative ${viewMode === 'split' ? 'h-1/2' : 'h-full'}`}><ViewContainer title="2D View (a-b)" onCapture={() => capture2DRef.current && capture2DRef.current()} onToggleLabels={() => setShowLabels(!showLabels)} showLabels={showLabels}><Canvas orthographic camera={{ position: [0, 0, 100], zoom: 1.5, near: 0.1, far: 1000 }} dpr={[1, 2]}><color attach="background" args={['#18181b']} /><Scene2D basePoints={basePoints} historyPoints={historyPoints} testPoints={processedTestPoints} captureRef={capture2DRef} showLabels={showLabels} gamutColorL={gamutColorL} gamutAutoL={gamutAutoL} gamutOpacity={gamutOpacity} /></Canvas></ViewContainer></div>}
                         </div>
                     </div>
                 </div>
