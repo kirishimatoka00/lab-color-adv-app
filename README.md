@@ -28,21 +28,31 @@ APK 由 GitHub Actions 自動建置：每次推送到 `main`，或在 **Actions 
 
 每個點（Base / History / Test）除了 Name、L、a、b 之外，都可以記錄 **Material（材質）**，輸入時會列出先前輸入過的材質供快速選擇。Excel 匯出會多一欄 `Material`；匯入時讀取 `Material`（或中文欄名「材質」），沒有這一欄也可以正常匯入。
 
-## In Gamut 判定與 Correction A & B
+## In Gamut 判定與 Correction A / B / C
 
-假設 a,b 不隨 L 改變：Test Point 只比較 a,b，是否落在 Base + History 所有點在 a-b 平面圍成的範圍內（顯示 In Gamut）。若在範圍外，卡片下方顯示兩種修正（ΔL 永遠為 0）：
+視圖右上角的 **View Settings**（滑桿圖示）可選擇 **Gamut Mode**：
 
-- **A**：Chroma 維持、只調整 Hue，取最接近且在 Gamut 內的 a,b。
+- **Projection**（預設）：假設 a,b 不隨 L 改變，以 Base + History 在 a-b 平面的投影範圍判定，ΔL 恆為 0。
+- **Slice by L**：以 Test Point 同一 L 的 a-b 截面判定，更貼近實際色域在高亮／低亮處收窄的情形；L 超出 Gamut 的 L 範圍時，A、B 會先移到最近可用的 L。
+
+Test Point 在範圍外時，卡片下方列出三種修正（皆顯示 L、a、b 與 ΔL / Δa / Δb / ΔC / ΔH / ΔE）：
+
+- **A**：Chroma 維持、調整 Hue，取最接近且在 Gamut 內的 a,b。
 - **B**：Hue 維持、降低 Chroma，取剛好落在 Gamut 內的 a,b。
+- **C（建議）**：最小 ΔE。Projection 模式＝同 L 下 a-b 平面上最近的點；Slice 模式＝保持 Hue、L 與 Chroma 皆可調的最近點（HPMINDE）。
 
-每項顯示修正後的 L、a、b，以及 Δa、Δb、ΔC、ΔH。該條件下無解時顯示 N/A（例如 Chroma 太大，圓周完全碰不到 Gamut）。
+某個修正在該條件下無解時顯示 N/A。3D / 2D 視圖會用虛線把 Test Point 連到 A（橘）、B（青）、C（綠）的目標點，可在 View Settings 關閉。
+
+## 材質分組與篩選
+
+View Settings 內列出所有出現過的材質：點選標籤可在視圖中隱藏／顯示該材質的點（只影響顯示，不影響 Gamut 計算），**Color by Material** 可改用材質顏色標示各點。
 
 ## 匯出／匯入
 
 標題列有四個按鈕：
 
-- **Export Excel**：匯出 `lab_gamut_data.xlsx`，每個工作表（Base / History / Test Points）只含 `Name、Material、L、a、b`，格式與 Excel 匯入相同，可直接再匯入。
-- **Export 全部資料與設定（.json）**：匯出 `lab_gamut_backup_時間.json`，包含 Base / History / Test 全部資料點（含材質、顯示與標準點狀態）與設定（色域顏色 L、透明度、標籤顯示、視圖模式、相機取樣範圍）。
+- **Export Excel**：匯出 `lab_gamut_data.xlsx`，每個工作表（Base / History / Test Points）含 `Name、Material、L、a、b`，格式與 Excel 匯入相同，可直接再匯入。Test Points 工作表另有 `InGamut` 與 `A_L/A_a/A_b`、`B_*`、`C_*` 修正結果欄位（匯入時忽略）。
+- **Export 全部資料與設定（.json）**：匯出 `lab_gamut_backup_時間.json`，包含 Base / History / Test 全部資料點（含材質、顯示與標準點狀態）與設定（色域顏色 L、透明度、標籤顯示、視圖模式、Gamut Mode、修正點顯示、材質篩選與配色、相機取樣範圍），另附 `corrections`（In Gamut 狀態與 A/B/C 修正結果，僅供參考）。
 - **Import 備份（.json）**：讀回上述 JSON，會取代目前所有資料與設定（匯入前會確認）。
 - **Import Excel**：維持原本行為，把資料點加到現有清單。
 
