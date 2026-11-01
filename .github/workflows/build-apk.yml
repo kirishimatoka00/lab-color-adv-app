@@ -39,8 +39,9 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # GitHub 的 ubuntu-latest 已內建 Android SDK，只需確認授權條款已接受
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
