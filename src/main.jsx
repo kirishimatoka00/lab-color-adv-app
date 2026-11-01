@@ -249,70 +249,208 @@ const GamutUtils = {
 /**
  * Camera Color Picker
  */
+/**
+ * 範圍平均取色
+ * 以「線性光」平均再轉回 sRGB（與色彩量測儀器相同的做法），比直接平均 sRGB 數值更準確。
+ */
+const SRGB_TO_LINEAR = (() => {
+    const lut = new Float32Array(256);
+    for (let i = 0; i < 256; i++) { const c = i / 255; lut[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+    return lut;
+})();
+const linearToSrgb255 = (v) => {
+    const c = Math.min(Math.max(v, 0), 1);
+    return 255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+};
+
+// 回傳平均 RGB（0-255）與 spread（範圍內各通道標準差的均方根，越小代表範圍內顏色越均勻）
+const averageRegion = (ctx, w, h) => {
+    const data = ctx.getImageData(0, 0, w, h).data;
+    let lr = 0, lg = 0, lb = 0, sr = 0, sg = 0, sb = 0, qr = 0, qg = 0, qb = 0, n = 0;
+    for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        lr += SRGB_TO_LINEAR[r]; lg += SRGB_TO_LINEAR[g]; lb += SRGB_TO_LINEAR[b];
+        sr += r; sg += g; sb += b; qr += r * r; qg += g * g; qb += b * b;
+        n++;
+    }
+    if (!n) return { r: 0, g: 0, b: 0, spread: 0 };
+    const varOf = (s, q) => Math.max(q / n - (s / n) * (s / n), 0);
+    const spread = Math.sqrt((varOf(sr, qr) + varOf(sg, qg) + varOf(sb, qb)) / 3);
+    return { r: linearToSrgb255(lr / n), g: linearToSrgb255(lg / n), b: linearToSrgb255(lb / n), spread };
+};
+
+// 在來源（video 或 img）以 (cx, cy) 為中心、邊長 side（來源像素）的正方形範圍內取平均色
+const sampleRegion = (canvas, source, W, H, cx, cy, side) => {
+    side = Math.max(2, Math.min(side, W, H));
+    const x0 = Math.min(Math.max(cx - side / 2, 0), W - side);
+    const y0 = Math.min(Math.max(cy - side / 2, 0), H - side);
+    const out = Math.max(2, Math.min(Math.round(side), 192)); // 範圍很大時縮小取樣以維持流暢
+    canvas.width = out; canvas.height = out;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, x0, y0, side, side, 0, 0, out, out);
+    return { ...averageRegion(ctx, out, out), area: Math.round(side) };
+};
+
+// 找出所有後置鏡頭，依 Android camera2 編號由小到大排序（編號最小的通常是 1x 主鏡頭）
+const listBackCameras = (devices) => {
+    const cams = devices.filter(d => d.kind === 'videoinput');
+    let backs = cams.filter(d => /back|rear|environment/i.test(d.label));
+    if (backs.length === 0) backs = cams.filter(d => !/front|user/i.test(d.label));
+    const idOf = (d) => { const m = /camera\d*\s+(\d+)/i.exec(d.label); return m ? parseInt(m[1], 10) : 1e9; };
+    return [...backs].sort((a, b) => idOf(a) - idOf(b));
+};
+
+const ZOOM_PRESETS = [0.5, 1, 2, 3, 5, 10];
+
+// 取色範圍框：框內就是實際取平均的範圍，框外變暗
+const RoiBox = ({ side, style }) => (
+    <div
+        className="absolute pointer-events-none"
+        style={{ width: side, height: side, border: '2px solid #fff', boxSizing: 'border-box', boxShadow: '0 0 0 1px rgba(0,0,0,0.65), 0 0 0 9999px rgba(0,0,0,0.5)', ...style }}
+    >
+        <div className="absolute left-1/2 top-1/2 w-1 h-1 -ml-0.5 -mt-0.5 rounded-full bg-white/80" />
+    </div>
+);
+
 const CameraPicker = ({ onCapture, onClose }) => {
     const videoRef = useRef(null);
     const canvasRef = useRef(null);
     const imgRef = useRef(null);
     const fileInputRef = useRef(null);
+    const viewRef = useRef(null);
+    const streamRef = useRef(null);
+    const aliveRef = useRef(true);
+    const draggingRef = useRef(false);
 
     const [color, setColor] = useState({ r: 0, g: 0, b: 0 });
     const [lab, setLab] = useState({ l: 0, a: 0, b: 0 });
+    const [info, setInfo] = useState({ area: 0, spread: 0 });
     const [stream, setStream] = useState(null);
     const [error, setError] = useState('');
     const [imageMode, setImageMode] = useState(false);
     const [uploadedImgSrc, setUploadedImgSrc] = useState(null);
-    const [pointerPos, setPointerPos] = useState(null);
-    const [isLocalFile, setIsLocalFile] = useState(window.location.protocol === 'file:');
+    const [pointerPos, setPointerPos] = useState(null); // 相簿模式：範圍框中心（相對取色畫面）與邊長
+    const [isLocalFile] = useState(window.location.protocol === 'file:');
+
+    // 取色範圍大小：占畫面短邊的百分比，記住上次設定
+    const [roiPct, setRoiPct] = useState(() => {
+        try { const v = parseFloat(localStorage.getItem('lab_camRoiPct')); return v >= 3 && v <= 40 ? v : 12; } catch (e) { return 12; }
+    });
+    const [viewSize, setViewSize] = useState({ w: 0, h: 0 });
+
+    // 鏡頭與變焦
+    const [cameras, setCameras] = useState([]);
+    const [cameraId, setCameraId] = useState(null);
+    const [zoomCaps, setZoomCaps] = useState(null);
+    const [zoom, setZoom] = useState(1);
+
+    const roiSide = Math.round(Math.min(viewSize.w, viewSize.h) * roiPct / 100);
+
+    const applySample = (res) => {
+        const r = Math.round(res.r), g = Math.round(res.g), b = Math.round(res.b);
+        setColor({ r, g, b });
+        setLab(ColorUtils.rgbToLab(res.r, res.g, res.b));
+        setInfo({ area: res.area, spread: res.spread });
+    };
+
+    // 追蹤取色畫面尺寸（用來畫範圍框）
+    useEffect(() => {
+        const el = viewRef.current; if (!el) return;
+        const update = () => setViewSize({ w: el.clientWidth, h: el.clientHeight });
+        update();
+        const ro = new ResizeObserver(update); ro.observe(el);
+        return () => ro.disconnect();
+    }, []);
+
+    useEffect(() => { try { localStorage.setItem('lab_camRoiPct', String(roiPct)); } catch (e) {} }, [roiPct]);
+
+    const stopStream = () => {
+        if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+    };
+
+    // 開啟指定鏡頭（wantedId 為空時使用預設後鏡頭），並讀取變焦能力
+    const openCamera = async (wantedId) => {
+        stopStream(); setStream(null);
+        const video = wantedId ? { deviceId: { exact: wantedId } } : { facingMode: { ideal: 'environment' } };
+        const s = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+        if (!aliveRef.current) { s.getTracks().forEach(t => t.stop()); throw new Error('cancelled'); }
+        streamRef.current = s;
+        if (videoRef.current) videoRef.current.srcObject = s;
+        setStream(s);
+        const track = s.getVideoTracks()[0];
+        const settings = track.getSettings ? track.getSettings() : {};
+        const caps = track.getCapabilities ? track.getCapabilities() : {};
+        setCameraId(settings.deviceId || wantedId || null);
+        if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+            setZoomCaps({ min: caps.zoom.min, max: caps.zoom.max });
+            let z = typeof settings.zoom === 'number' ? settings.zoom : 1;
+            // 預設回到 1x（部分手機預設倍率不在 1x）
+            if (caps.zoom.min <= 1 && caps.zoom.max >= 1 && Math.abs(z - 1) > 0.01) {
+                try { await track.applyConstraints({ advanced: [{ zoom: 1 }] }); z = 1; } catch (e) { /* 此鏡頭不支援變焦 */ }
+            }
+            setZoom(z);
+        } else { setZoomCaps(null); setZoom(1); }
+        return settings.deviceId;
+    };
 
     useEffect(() => {
-        const startCamera = async () => {
+        if (imageMode) return;
+        aliveRef.current = true;
+        (async () => {
             if (isLocalFile) {
                 setError("Browser Security Restriction: Local files (file://) cannot access camera directly.\nPlease use the 'Album/Photo' button below.");
                 return;
             }
             try {
-                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                    throw new Error("Browser API not supported");
-                }
-                const s = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: 'environment' },
-                    audio: false
-                });
-                setStream(s);
-                if (videoRef.current) {
-                    videoRef.current.srcObject = s;
-                }
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("Browser API not supported");
+                let saved = null;
+                try { saved = localStorage.getItem('lab_camDeviceId'); } catch (e) {}
+                let usedId;
+                try { usedId = await openCamera(saved); }
+                catch (e) { if (saved && aliveRef.current) usedId = await openCamera(null); else throw e; } // 記住的鏡頭不存在時改用預設
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                if (!aliveRef.current) return;
+                const backs = listBackCameras(devices);
+                setCameras(backs);
+                // 沒有手動選過鏡頭時，預設改用編號最小的後鏡頭（通常是 1x 主鏡頭）
+                if (!saved && backs.length > 1 && backs[0].deviceId !== usedId) await openCamera(backs[0].deviceId);
             } catch (err) {
+                if (!aliveRef.current) return;
                 console.warn("Camera access failed", err);
                 setError("Cannot start camera. Reasons might be:\n1. Browser security (HTTPS required)\n2. Permission denied\nPlease use 'Album/Photo' button.");
             }
-        };
-        if (!imageMode) startCamera();
-        return () => { if (stream) stream.getTracks().forEach(track => track.stop()); };
+        })();
+        return () => { aliveRef.current = false; stopStream(); };
     }, [imageMode, isLocalFile]);
 
+    // 即時畫面：每 0.1 秒對畫面中央的範圍框取平均色
     useEffect(() => {
         if (!stream || imageMode) return;
         const interval = setInterval(() => {
-            if (videoRef.current && canvasRef.current) {
-                const video = videoRef.current;
-                const canvas = canvasRef.current;
-                const context = canvas.getContext('2d');
-                if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                    canvas.width = video.videoWidth;
-                    canvas.height = video.videoHeight;
-                    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-                    const centerX = Math.floor(canvas.width / 2);
-                    const centerY = Math.floor(canvas.height / 2);
-                    const pixelData = context.getImageData(centerX, centerY, 1, 1).data;
-                    const r = pixelData[0]; const g = pixelData[1]; const b = pixelData[2];
-                    setColor({ r, g, b });
-                    setLab(ColorUtils.rgbToLab(r, g, b));
-                }
-            }
+            const video = videoRef.current, canvas = canvasRef.current, view = viewRef.current;
+            if (!video || !canvas || !view || !video.videoWidth || video.readyState < video.HAVE_ENOUGH_DATA) return;
+            const cw = view.clientWidth, ch = view.clientHeight;
+            const scale = Math.max(cw / video.videoWidth, ch / video.videoHeight); // object-cover 的縮放倍率
+            const sideCss = Math.min(cw, ch) * roiPct / 100;
+            applySample(sampleRegion(canvas, video, video.videoWidth, video.videoHeight, video.videoWidth / 2, video.videoHeight / 2, sideCss / scale));
         }, 100);
         return () => clearInterval(interval);
-    }, [stream, imageMode]);
+    }, [stream, imageMode, roiPct]);
+
+    const switchLens = async (deviceId) => {
+        if (deviceId === cameraId) return;
+        try { localStorage.setItem('lab_camDeviceId', deviceId); } catch (e) {}
+        try { await openCamera(deviceId); }
+        catch (e) { console.warn('Switch lens failed', e); }
+    };
+
+    const applyZoom = async (z) => {
+        const track = streamRef.current && streamRef.current.getVideoTracks()[0];
+        if (!track) return;
+        try { await track.applyConstraints({ advanced: [{ zoom: z }] }); setZoom(z); }
+        catch (e) { console.warn('Zoom failed', e); }
+    };
 
     const handleCaptureClick = () => { onCapture(lab); onClose(); };
     const triggerFileInput = () => fileInputRef.current && fileInputRef.current.click();
@@ -322,45 +460,71 @@ const CameraPicker = ({ onCapture, onClose }) => {
             const reader = new FileReader();
             reader.onload = (evt) => {
                 setUploadedImgSrc(evt.target.result);
+                setPointerPos(null);
                 setImageMode(true);
                 setError('');
-                if (stream) { stream.getTracks().forEach(track => track.stop()); setStream(null); }
+                stopStream(); setStream(null);
             };
             reader.readAsDataURL(file);
         }
     };
-    const handleImageClick = (e) => {
-        if (!imgRef.current || !canvasRef.current) return;
-        const img = imgRef.current;
-        const canvas = canvasRef.current;
-        const ctx = canvas.getContext('2d');
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        ctx.drawImage(img, 0, 0);
-        const rect = img.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        const scaleX = img.naturalWidth / rect.width;
-        const scaleY = img.naturalHeight / rect.height;
-        const naturalX = Math.floor(x * scaleX);
-        const naturalY = Math.floor(y * scaleY);
-        const pixelData = ctx.getImageData(naturalX, naturalY, 1, 1).data;
-        const r = pixelData[0]; const g = pixelData[1]; const b = pixelData[2];
-        setColor({ r, g, b });
-        setLab(ColorUtils.rgbToLab(r, g, b));
-        setPointerPos({ x: e.clientX, y: e.clientY });
+
+    // 相簿模式：以點選／拖曳位置為中心取範圍平均（範圍框不會超出圖片邊界）
+    const pickAt = (clientX, clientY) => {
+        const img = imgRef.current, canvas = canvasRef.current, view = viewRef.current;
+        if (!img || !canvas || !view || !img.naturalWidth) return;
+        const rect = img.getBoundingClientRect(), vr = view.getBoundingClientRect();
+        const sideCss = Math.min(Math.min(vr.width, vr.height) * roiPct / 100, rect.width, rect.height);
+        const cx = Math.min(Math.max(clientX, rect.left + sideCss / 2), rect.right - sideCss / 2);
+        const cy = Math.min(Math.max(clientY, rect.top + sideCss / 2), rect.bottom - sideCss / 2);
+        const k = img.naturalWidth / rect.width;
+        applySample(sampleRegion(canvas, img, img.naturalWidth, img.naturalHeight, (cx - rect.left) * k, (cy - rect.top) * k, sideCss * k));
+        setPointerPos({ x: cx - vr.left, y: cy - vr.top, side: sideCss });
     };
+    const onImgPointerDown = (e) => {
+        draggingRef.current = true;
+        e.currentTarget.setPointerCapture && e.currentTarget.setPointerCapture(e.pointerId);
+        pickAt(e.clientX, e.clientY);
+    };
+    const onImgPointerMove = (e) => { if (draggingRef.current) pickAt(e.clientX, e.clientY); };
+    const onImgPointerUp = (e) => {
+        draggingRef.current = false;
+        e.currentTarget.releasePointerCapture && e.currentTarget.releasePointerCapture(e.pointerId);
+    };
+    const onImgLoad = () => {
+        const r = imgRef.current.getBoundingClientRect();
+        pickAt(r.left + r.width / 2, r.top + r.height / 2);
+    };
+    // 相簿模式下調整範圍大小時，以同一個中心點重新取色
+    useEffect(() => {
+        if (!imageMode || !pointerPos || !viewRef.current) return;
+        const vr = viewRef.current.getBoundingClientRect();
+        pickAt(vr.left + pointerPos.x, vr.top + pointerPos.y);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [roiPct]);
+
+    const uniformity = info.spread <= 6 ? ['Uniform area', 'text-emerald-400']
+        : info.spread <= 15 ? ['Slight variation', 'text-yellow-400']
+        : ['Uneven – aim at a flat area', 'text-red-400'];
+    const zoomChips = zoomCaps ? ZOOM_PRESETS.filter(v => v >= zoomCaps.min - 0.01 && v <= zoomCaps.max + 0.01) : [];
+    const chip = (active) => `px-3 py-1.5 rounded-full text-xs font-bold border backdrop-blur-md transition-colors active:scale-95 ${active ? 'bg-blue-600 text-white border-blue-400' : 'bg-black/50 text-white/80 border-white/20'}`;
+    const currentLensLabel = (cameras.find(c => c.deviceId === cameraId) || {}).label;
 
     return (
         <div className="fixed inset-0 z-50 bg-black flex flex-col" style={{ paddingTop: 'env(safe-area-inset-top)' }}>
-            <div className="relative flex-1 bg-black flex items-center justify-center overflow-hidden">
+            <div ref={viewRef} className="relative flex-1 bg-black flex items-center justify-center overflow-hidden">
                 {imageMode ? (
-                    <div className="relative w-full h-full flex items-center justify-center bg-gray-900 cursor-crosshair">
-                        <img ref={imgRef} src={uploadedImgSrc} className="max-w-full max-h-full object-contain" onClick={handleImageClick} alt="Uploaded" />
-                        {pointerPos && (
-                            <div className="fixed w-8 h-8 border-2 border-white rounded-full pointer-events-none transform -translate-x-1/2 -translate-y-1/2 shadow-[0_0_10px_rgba(0,0,0,0.8)]" style={{ left: pointerPos.x, top: pointerPos.y, backgroundColor: `rgb(${color.r},${color.g},${color.b})` }}></div>
-                        )}
-                        <div className="absolute top-6 bg-black/70 text-white px-4 py-2 rounded-full text-sm pointer-events-none backdrop-blur-md shadow-lg border border-white/10">👆 Tap anywhere to pick color</div>
+                    <div className="relative w-full h-full flex items-center justify-center bg-gray-900">
+                        <img
+                            ref={imgRef} src={uploadedImgSrc} alt="Uploaded"
+                            className="max-w-full max-h-full object-contain cursor-crosshair select-none"
+                            style={{ touchAction: 'none' }}
+                            draggable={false}
+                            onLoad={onImgLoad}
+                            onPointerDown={onImgPointerDown} onPointerMove={onImgPointerMove} onPointerUp={onImgPointerUp} onPointerCancel={onImgPointerUp}
+                        />
+                        {pointerPos && <RoiBox side={pointerPos.side} style={{ left: pointerPos.x - pointerPos.side / 2, top: pointerPos.y - pointerPos.side / 2 }} />}
+                        <div className="absolute top-6 bg-black/70 text-white px-4 py-2 rounded-full text-sm pointer-events-none backdrop-blur-md shadow-lg border border-white/10">👆 Tap or drag to move the sampling box</div>
                     </div>
                 ) : (
                     <>
@@ -373,11 +537,30 @@ const CameraPicker = ({ onCapture, onClose }) => {
                             </div>
                         ) : (
                             <>
-                                <video ref={videoRef} autoPlay playsInline className="absolute w-full h-full object-cover" />
+                                <video ref={videoRef} autoPlay playsInline muted className="absolute w-full h-full object-cover" />
                                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                                    <div className="w-16 h-16 border-2 border-white/70 rounded-full flex items-center justify-center shadow-lg"><div className="w-1 h-6 bg-white/90"></div><div className="h-1 w-6 bg-white/90 absolute"></div></div>
+                                    {roiSide > 0 && <RoiBox side={roiSide} />}
                                 </div>
                                 <div className="absolute top-6 left-0 right-0 text-center pointer-events-none"><span className="bg-black/60 text-white/90 px-4 py-1.5 rounded-full text-xs backdrop-blur-sm border border-white/10">⚠ Values affected by lighting, for reference only</span></div>
+                                {(cameras.length > 1 || zoomChips.length > 1) && (
+                                    <div className="absolute bottom-3 left-0 right-0 z-10 flex flex-col items-center gap-2 px-3">
+                                        {zoomChips.length > 1 && (
+                                            <div className="flex gap-2" role="group" aria-label="Zoom">
+                                                {zoomChips.map(v => (
+                                                    <button key={v} onClick={() => applyZoom(v)} className={chip(Math.abs(zoom - v) < 0.05)}>{v}x</button>
+                                                ))}
+                                            </div>
+                                        )}
+                                        {cameras.length > 1 && (
+                                            <div className="flex gap-2" role="group" aria-label="Lens">
+                                                {cameras.map((c, i) => (
+                                                    <button key={c.deviceId} onClick={() => switchLens(c.deviceId)} title={c.label} className={chip(c.deviceId === cameraId)}>Lens {i + 1}</button>
+                                                ))}
+                                            </div>
+                                        )}
+                                        {currentLensLabel && <span className="text-[10px] text-white/60 bg-black/40 px-2 py-0.5 rounded-full">{currentLensLabel}</span>}
+                                    </div>
+                                )}
                             </>
                         )}
                     </>
@@ -385,15 +568,21 @@ const CameraPicker = ({ onCapture, onClose }) => {
                 <canvas ref={canvasRef} className="hidden" />
                 <input ref={fileInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFileUpload} />
             </div>
-            <div className="bg-gray-900 p-5 flex flex-col gap-5 border-t border-gray-800" style={{ paddingBottom: 'max(2.5rem, calc(env(safe-area-inset-bottom) + 1rem))' }}>
+            <div className="bg-gray-900 p-5 flex flex-col gap-4 border-t border-gray-800" style={{ paddingBottom: 'max(2.5rem, calc(env(safe-area-inset-bottom) + 1rem))' }}>
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-4">
                         <div className="w-14 h-14 rounded-full border-2 border-white shadow-lg transition-colors duration-200" style={{ backgroundColor: `rgb(${color.r}, ${color.g}, ${color.b})` }}></div>
                         <div className="flex flex-col text-white">
                             <span className="text-xs text-gray-400 font-mono tracking-wider">RGB: {color.r}, {color.g}, {color.b}</span>
                             <span className="font-mono font-bold text-xl text-yellow-400 tracking-tight">L{lab.l} a{lab.a} b{lab.b}</span>
+                            <span className="text-[11px] text-gray-400">Avg of {info.area}×{info.area}px · <span className={uniformity[1]}>{uniformity[0]}</span></span>
                         </div>
                     </div>
+                </div>
+                <div className="flex items-center gap-3 text-white">
+                    <span className="text-xs text-gray-400 font-bold w-12 shrink-0">Area</span>
+                    <input type="range" min="3" max="40" step="1" value={roiPct} onChange={(e) => setRoiPct(Number(e.target.value))} aria-label="Sampling area size" className="flex-1 accent-blue-500" />
+                    <span className="text-xs font-mono text-gray-300 w-10 text-right">{roiPct}%</span>
                 </div>
                 <div className="grid grid-cols-3 gap-4">
                     <button onClick={onClose} className="bg-gray-800 active:bg-gray-700 text-white py-3.5 rounded-xl font-bold text-sm transition-colors">Cancel</button>
@@ -708,7 +897,7 @@ const Scene2D = ({ basePoints, historyPoints, testPoints, captureRef, showLabels
 const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorClass = 'text-blue-700', deltaE, isStandard, onToggleStandard }) => {
     const colorPreview = ColorUtils.labToHex(point.l, point.a, point.b);
     const handleChange = (field, value) => {
-        if (field === 'name' || field === 'visible' || field === 'showPoint') { onChange(point.id, field, value); return; }
+        if (field === 'name' || field === 'material' || field === 'visible' || field === 'showPoint') { onChange(point.id, field, value); return; }
         let val = parseFloat(value); if(isNaN(val)) val = 0;
         if (field === 'l') val = ColorUtils.clamp(val, 0, 200); if (field === 'a' || field === 'b') val = ColorUtils.clamp(val, -200, 200);
         onChange(point.id, field, val);
@@ -788,6 +977,10 @@ const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorCl
                 <input type="text" placeholder="Name" value={point.name || ''} onChange={(e) => handleChange('name', e.target.value)} className={`flex-1 min-w-0 md:flex-none md:w-16 text-sm md:text-xs font-medium focus:outline-none placeholder-gray-300 bg-transparent ${inputColorClass}`} />
                 {isTestPoint && !isStandard && deltaE && <div className="ml-auto bg-gray-100 px-1.5 py-0.5 rounded text-[10px] font-mono text-gray-600 flex items-center"><span className="font-bold text-gray-400 mr-1">ΔE</span><span className={parseFloat(deltaE) > 5 ? "text-red-500 font-bold" : "text-gray-800"}>{deltaE}</span></div>}
                 {isStandard && <div className="ml-auto bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded text-[10px] font-bold">STD</div>}
+            </div>
+            <div className="mb-2 flex items-center gap-1 border-b border-gray-100 pb-1">
+                <span className="text-[10px] text-gray-400 font-bold mr-1">Material:</span>
+                <input type="text" list="material-options" placeholder="Material" value={point.material || ''} onChange={(e) => handleChange('material', e.target.value)} className={`flex-1 min-w-0 text-sm md:text-xs font-medium focus:outline-none placeholder-gray-300 bg-transparent ${inputColorClass}`} />
             </div>
             <div className="flex items-center gap-2">
                 <div className="w-8 h-8 rounded-md border border-gray-200 shadow-inner flex-shrink-0" style={{ backgroundColor: colorPreview }} title={`Preview: ${colorPreview}`} />
@@ -891,8 +1084,8 @@ function App() {
     useEffect(() => { window.localStorage.setItem('lab_basePoints', JSON.stringify(basePoints)); window.localStorage.setItem('lab_historyPoints', JSON.stringify(historyPoints)); window.localStorage.setItem('lab_testPoints', JSON.stringify(testPoints)); }, [basePoints, historyPoints, testPoints]);
     
     const capture3DRef = useRef(null); const capture2DRef = useRef(null);
-    const addPoint = (type) => { const newPoint = { id: Date.now(), l: 50, a: 0, b: 0, name: '', visible: true, showPoint: true, isStandard: false }; if (type === 'base') setBasePoints([...basePoints, newPoint]); else if (type === 'history') setHistoryPoints([...historyPoints, newPoint]); else setTestPoints([...testPoints, newPoint]); };
-    const addFromCamera = (labData) => { const newPoint = { id: Date.now(), l: labData.l, a: labData.a, b: labData.b, name: 'Cam Capture', visible: true, showPoint: true, isStandard: false }; setTestPoints([...testPoints, newPoint]); };
+    const addPoint = (type) => { const newPoint = { id: Date.now(), l: 50, a: 0, b: 0, name: '', material: '', visible: true, showPoint: true, isStandard: false }; if (type === 'base') setBasePoints([...basePoints, newPoint]); else if (type === 'history') setHistoryPoints([...historyPoints, newPoint]); else setTestPoints([...testPoints, newPoint]); };
+    const addFromCamera = (labData) => { const newPoint = { id: Date.now(), l: labData.l, a: labData.a, b: labData.b, name: 'Cam Capture', material: '', visible: true, showPoint: true, isStandard: false }; setTestPoints([...testPoints, newPoint]); };
     const updatePoint = (listType, id, field, value) => { let setter = listType === 'base' ? setBasePoints : (listType === 'history' ? setHistoryPoints : setTestPoints); setter(prev => prev.map(p => p.id === id ? { ...p, [field]: value } : p)); };
     const toggleStandard = (id) => { setTestPoints(prev => prev.map(p => ({ ...p, isStandard: p.id === id ? !p.isStandard : false }))); };
     const deletePoint = (listType, id) => { let setter = listType === 'base' ? setBasePoints : (listType === 'history' ? setHistoryPoints : setTestPoints); setter(prev => prev.filter(p => p.id !== id)); };
@@ -943,6 +1136,11 @@ function App() {
                             const key = keys.find(key => key.toLowerCase() === 'name');
                             return key ? row[key] : '';
                         }
+                        // 材質欄位：Material（或中文「材質」），可省略
+                        const getMaterial = () => {
+                            const key = keys.find(key => ['material', '材質'].includes(key.trim().toLowerCase()));
+                            return key && row[key] != null ? String(row[key]) : '';
+                        }
 
                         // Look for 'L', 'a', 'b' specifically
                         const l = getVal('l');
@@ -956,6 +1154,7 @@ function App() {
                                 a: ColorUtils.clamp(a, -200, 200),
                                 b: ColorUtils.clamp(b, -200, 200),
                                 name: getName(),
+                                material: getMaterial(),
                                 visible: true,
                                 showPoint: true,
                                 isStandard: false
@@ -983,7 +1182,7 @@ function App() {
             } catch (err) {
                 console.error(err);
                 // Updated error message to reflect expected format
-                alert("Failed to parse Excel file. Please check format: Name, L, a, b");
+                alert("Failed to parse Excel file. Please check format: Name, Material (optional), L, a, b");
             }
             // Reset input
             if (fileInputRef.current) fileInputRef.current.value = '';
@@ -999,6 +1198,7 @@ function App() {
 
         const formatData = (points) => points.map(p => ({
             Name: p.name,
+            Material: p.material || '',
             L: p.l,
             a: p.a,
             b: p.b,
@@ -1043,6 +1243,10 @@ function App() {
         <div className="fixed inset-0 flex flex-col md:flex-row w-full h-full bg-[#1e1e24] md:bg-slate-50 font-sans text-gray-800 overflow-hidden" style={{ paddingTop: 'env(safe-area-inset-top)', paddingLeft: 'env(safe-area-inset-left)', paddingRight: 'env(safe-area-inset-right)' }}>
             {showCamera && <CameraPicker onCapture={addFromCamera} onClose={() => setShowCamera(false)} />}
             <input type="file" ref={fileInputRef} onChange={handleExcelImport} accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" className="hidden" />
+            {/* 材質欄位的輸入建議：列出已輸入過的材質 */}
+            <datalist id="material-options">
+                {[...new Set([...basePoints, ...historyPoints, ...testPoints].map(p => (p.material || '').trim()).filter(Boolean))].map(m => <option key={m} value={m} />)}
+            </datalist>
             <nav className="order-last md:hidden shrink-0 flex bg-[#1e1e24] border-t border-white/10" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
                 {[['data', 'Points', List], ['view', 'Viewer', Box]].map(([key, label, Icon]) => (
                     <button key={key} onClick={() => setMobileTab(key)} aria-current={mobileTab === key ? 'page' : undefined} className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-2 text-[11px] font-bold transition-colors active:bg-white/5 ${mobileTab === key ? 'text-blue-400' : 'text-gray-500'}`}>
