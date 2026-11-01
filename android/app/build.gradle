@@ -8,8 +8,8 @@ android {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         // CI 會以 GitHub Actions 的執行編號覆寫，確保每次建置的版本號遞增
-        versionCode (System.getenv("APP_VERSION_CODE") ?: "1").toInteger()
-        versionName System.getenv("APP_VERSION_NAME") ?: "1.0"
+        versionCode = Integer.parseInt(System.getenv("APP_VERSION_CODE") ?: "1")
+        versionName = System.getenv("APP_VERSION_NAME") ?: "1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
