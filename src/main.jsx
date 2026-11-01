@@ -165,25 +165,11 @@ const ColorUtils = {
  * Gamut Calculation Utilities
  */
 const GamutUtils = {
-    // 取得 Gamut（凸包）在指定 L 高度的 a,b 截面多邊形（逆時針凸多邊形）
-    sliceAtL: (mesh, L) => {
+    // 假設 a,b 不隨 L 改變：取 Gamut 所有頂點投影到 a-b 平面的 2D 凸包（逆時針凸多邊形）
+    projectAB: (mesh) => {
         const pos = mesh.geometry.attributes.position;
-        const idx = mesh.geometry.index ? mesh.geometry.index.array : null;
-        const triCount = idx ? idx.length / 3 : pos.count / 3;
-        const EPS = 1e-9;
         const pts = [];
-        const vert = (n) => { const i = idx ? idx[n] : n; return [pos.getX(i), pos.getY(i), pos.getZ(i)]; }; // [a, L, b]
-        for (let t = 0; t < triCount; t++) {
-            const v = [vert(t * 3), vert(t * 3 + 1), vert(t * 3 + 2)];
-            for (let i = 0; i < 3; i++) {
-                const P = v[i], Q = v[(i + 1) % 3];
-                if (Math.abs(P[1] - L) < EPS) pts.push([P[0], P[2]]);
-                if ((P[1] - L) * (Q[1] - L) < 0) {
-                    const k = (L - P[1]) / (Q[1] - P[1]);
-                    pts.push([P[0] + k * (Q[0] - P[0]), P[2] + k * (Q[2] - P[2])]);
-                }
-            }
-        }
+        for (let i = 0; i < pos.count; i++) pts.push([pos.getX(i), pos.getZ(i)]); // X=a, Z=b
         if (pts.length < 3) return null;
         // Monotone chain 凸包
         pts.sort((u, w) => u[0] - w[0] || u[1] - w[1]);
@@ -197,24 +183,18 @@ const GamutUtils = {
         return hull.length >= 3 ? hull : null;
     },
 
-    // 判定 In Gamut，並計算兩種修正：
+    // 假設 a,b 不隨 L 改變，因此只比較 a,b（ΔL 永遠為 0）：
     //  A：Chroma 維持、調整 Hue 到最接近且在 Gamut 內的 a,b
     //  B：Hue 維持、降低 Chroma 到剛好在 Gamut 內的 a,b
-    // 修正皆在相同 L 的截面上進行；若 L 超出 Gamut 的 L 範圍，則先移到最近的可用 L（dl 不為 0）。
     calculateCorrections: (pt, mesh) => {
         if (!mesh || !mesh.geometry || !pt) return null;
-        const pos = mesh.geometry.attributes.position;
-        let minL = Infinity, maxL = -Infinity;
-        for (let i = 0; i < pos.count; i++) { const y = pos.getY(i); if (y < minL) minL = y; if (y > maxL) maxL = y; }
-        const lInRange = pt.l >= minL && pt.l <= maxL;
-        const margin = Math.min(0.05, (maxL - minL) / 4);
-        const Lc = lInRange ? pt.l : Math.min(maxL - margin, Math.max(minL + margin, pt.l));
-        const poly = GamutUtils.sliceAtL(mesh, Lc);
+        const Lc = pt.l;
+        const poly = GamutUtils.projectAB(mesh);
         if (!poly) return { isInside: false, noSlice: true };
 
         const n = poly.length;
         const inside = poly.every((P, i) => { const Q = poly[(i + 1) % n]; return (Q[0] - P[0]) * (pt.b - P[1]) - (Q[1] - P[1]) * (pt.a - P[0]) >= -1e-9; });
-        if (lInRange && inside) return { isInside: true };
+        if (inside) return { isInside: true };
 
         const C = Math.hypot(pt.a, pt.b);
         const H = Math.atan2(pt.b, pt.a);
@@ -226,9 +206,6 @@ const GamutUtils = {
             return { l: Lc, a, b, dl: Lc - pt.l, da: a - pt.a, db: b - pt.b, dC: c2 - C, dH: C < 1e-6 ? 0 : dh };
         };
         const wrap = (x) => { let d = x; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
-
-        // L 超出範圍但 a,b 已在截面內：僅需調整 L
-        if (inside) { const same = make(pt.a, pt.b); return { isInside: false, A: same, B: same }; }
 
         // A：與半徑 C 的圓相交的各邊交點，取色相角最近者
         let A = null;
@@ -1046,7 +1023,7 @@ const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorCl
                                     <span>b: <span className="text-blue-600">{r.b.toFixed(1)}</span></span>
                                 </div>
                                 <div className="flex justify-between text-slate-500">
-                                    <span>ΔL {f(r.dl)}</span><span>Δa {f(r.da)}</span><span>Δb {f(r.db)}</span>
+                                    <span>Δa {f(r.da)}</span><span>Δb {f(r.db)}</span>
                                     <span>ΔC {f(r.dC)}</span><span>ΔH {f(r.dH)}°</span>
                                 </div>
                             </div>
@@ -1058,7 +1035,7 @@ const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorCl
                         {g.isInside ? (
                             <span className="font-bold flex items-center gap-1"><div className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></div> In Gamut</span>
                         ) : g.noSlice ? (
-                            <span className="font-bold text-slate-500">Out of Gamut（此 L 無法計算截面）</span>
+                            <span className="font-bold text-slate-500">Out of Gamut（Gamut 範圍不足以計算）</span>
                         ) : (
                             <div className="flex flex-col w-full">
                                 <span className="font-bold text-orange-600 flex items-center gap-1"><CornerRightDown size={10}/> Out of Gamut — Correction A & B</span>

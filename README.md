@@ -30,12 +30,12 @@ APK 由 GitHub Actions 自動建置：每次推送到 `main`，或在 **Actions 
 
 ## In Gamut 判定與 Correction A & B
 
-Test Point 以「相同 L 的 a,b 截面」判定是否在 Base + History 圍成的 Gamut 內（顯示 In Gamut）。若在範圍外，卡片下方顯示兩種修正（皆在相同 L 上計算）：
+假設 a,b 不隨 L 改變：Test Point 只比較 a,b，是否落在 Base + History 所有點在 a-b 平面圍成的範圍內（顯示 In Gamut）。若在範圍外，卡片下方顯示兩種修正（ΔL 永遠為 0）：
 
 - **A**：Chroma 維持、只調整 Hue，取最接近且在 Gamut 內的 a,b。
 - **B**：Hue 維持、降低 Chroma，取剛好落在 Gamut 內的 a,b。
 
-每項顯示修正後的 L、a、b，以及 ΔL、Δa、Δb、ΔC、ΔH。該條件下無解時顯示 N/A（例如 Chroma 太大，圓周完全碰不到 Gamut）。若 L 超出 Gamut 的 L 範圍，會先移到最近的可用 L（ΔL 不為 0）再計算。
+每項顯示修正後的 L、a、b，以及 Δa、Δb、ΔC、ΔH。該條件下無解時顯示 N/A（例如 Chroma 太大，圓周完全碰不到 Gamut）。
 
 ## 匯出／匯入
 
