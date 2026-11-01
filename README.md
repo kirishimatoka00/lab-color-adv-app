@@ -28,6 +28,15 @@ APK 由 GitHub Actions 自動建置：每次推送到 `main`，或在 **Actions 
 
 每個點（Base / History / Test）除了 Name、L、a、b 之外，都可以記錄 **Material（材質）**，輸入時會列出先前輸入過的材質供快速選擇。Excel 匯出會多一欄 `Material`；匯入時讀取 `Material`（或中文欄名「材質」），沒有這一欄也可以正常匯入。
 
+## In Gamut 判定與 Correction A & B
+
+Test Point 以「相同 L 的 a,b 截面」判定是否在 Base + History 圍成的 Gamut 內（顯示 In Gamut）。若在範圍外，卡片下方顯示兩種修正（皆在相同 L 上計算）：
+
+- **A**：Chroma 維持、只調整 Hue，取最接近且在 Gamut 內的 a,b。
+- **B**：Hue 維持、降低 Chroma，取剛好落在 Gamut 內的 a,b。
+
+每項顯示修正後的 L、a、b，以及 ΔL、Δa、Δb、ΔC、ΔH。該條件下無解時顯示 N/A（例如 Chroma 太大，圓周完全碰不到 Gamut）。若 L 超出 Gamut 的 L 範圍，會先移到最近的可用 L（ΔL 不為 0）再計算。
+
 ## 匯出／匯入
 
 標題列有四個按鈕：

@@ -165,84 +165,113 @@ const ColorUtils = {
  * Gamut Calculation Utilities
  */
 const GamutUtils = {
-    // Calculate closest deltas to the gamut volume
-    calculateClosestDeltas: (targetPoint, mesh) => {
-        if (!mesh || !mesh.geometry) return null;
-        if (!targetPoint) return null;
-
-        // In our scene: X=a, Y=l, Z=b
-        const targetPos = new THREE.Vector3(targetPoint.a, targetPoint.l, targetPoint.b);
-
-        // 1. Raycast for L-priority (Vertical line test)
-        const raycaster = new THREE.Raycaster();
-        const rayOrigin = new THREE.Vector3(targetPoint.a, 1000, targetPoint.b);
-        const rayDir = new THREE.Vector3(0, -1, 0); // Downwards along L (Y axis)
-        raycaster.set(rayOrigin, rayDir);
-
-        mesh.updateMatrixWorld();
-        const intersects = raycaster.intersectObject(mesh, false);
-
-        if (intersects.length > 0) {
-            // Collect all hits (both entry and exit points due to DoubleSide material)
-            const hitLs = intersects.map(hit => hit.point.y).sort((a, b) => a - b);
-            const minL = hitLs[0];
-            const maxL = hitLs[hitLs.length - 1];
-            const currentL = targetPoint.l;
-
-            if (currentL >= minL && currentL <= maxL) {
-                return { dl: 0, da: 0, db: 0, isInside: true, type: 'inside' };
-            } else {
-                const diffMin = Math.abs(currentL - minL);
-                const diffMax = Math.abs(currentL - maxL);
-                let targetL;
-                if (diffMin < diffMax) targetL = minL;
-                else targetL = maxL;
-                return { dl: (targetL - currentL).toFixed(1), da: 0, db: 0, isInside: false, type: 'l-only' };
+    // 取得 Gamut（凸包）在指定 L 高度的 a,b 截面多邊形（逆時針凸多邊形）
+    sliceAtL: (mesh, L) => {
+        const pos = mesh.geometry.attributes.position;
+        const idx = mesh.geometry.index ? mesh.geometry.index.array : null;
+        const triCount = idx ? idx.length / 3 : pos.count / 3;
+        const EPS = 1e-9;
+        const pts = [];
+        const vert = (n) => { const i = idx ? idx[n] : n; return [pos.getX(i), pos.getY(i), pos.getZ(i)]; }; // [a, L, b]
+        for (let t = 0; t < triCount; t++) {
+            const v = [vert(t * 3), vert(t * 3 + 1), vert(t * 3 + 2)];
+            for (let i = 0; i < 3; i++) {
+                const P = v[i], Q = v[(i + 1) % 3];
+                if (Math.abs(P[1] - L) < EPS) pts.push([P[0], P[2]]);
+                if ((P[1] - L) * (Q[1] - L) < 0) {
+                    const k = (L - P[1]) / (Q[1] - P[1]);
+                    pts.push([P[0] + k * (Q[0] - P[0]), P[2] + k * (Q[2] - P[2])]);
+                }
             }
         }
+        if (pts.length < 3) return null;
+        // Monotone chain 凸包
+        pts.sort((u, w) => u[0] - w[0] || u[1] - w[1]);
+        const cross = (o, p1, p2) => (p1[0] - o[0]) * (p2[1] - o[1]) - (p1[1] - o[1]) * (p2[0] - o[0]);
+        const lower = [];
+        for (const q of pts) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 1e-12) lower.pop(); lower.push(q); }
+        const upper = [];
+        for (let i = pts.length - 1; i >= 0; i--) { const q = pts[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 1e-12) upper.pop(); upper.push(q); }
+        lower.pop(); upper.pop();
+        const hull = lower.concat(upper);
+        return hull.length >= 3 ? hull : null;
+    },
 
-        // 2. Nearest point on surface
-        const posAttr = mesh.geometry.attributes.position;
-        const triangle = new THREE.Triangle();
-        let minDistSq = Infinity;
-        let closestPoint = new THREE.Vector3();
-        const tempPoint = new THREE.Vector3();
+    // 判定 In Gamut，並計算兩種修正：
+    //  A：Chroma 維持、調整 Hue 到最接近且在 Gamut 內的 a,b
+    //  B：Hue 維持、降低 Chroma 到剛好在 Gamut 內的 a,b
+    // 修正皆在相同 L 的截面上進行；若 L 超出 Gamut 的 L 範圍，則先移到最近的可用 L（dl 不為 0）。
+    calculateCorrections: (pt, mesh) => {
+        if (!mesh || !mesh.geometry || !pt) return null;
+        const pos = mesh.geometry.attributes.position;
+        let minL = Infinity, maxL = -Infinity;
+        for (let i = 0; i < pos.count; i++) { const y = pos.getY(i); if (y < minL) minL = y; if (y > maxL) maxL = y; }
+        const lInRange = pt.l >= minL && pt.l <= maxL;
+        const margin = Math.min(0.05, (maxL - minL) / 4);
+        const Lc = lInRange ? pt.l : Math.min(maxL - margin, Math.max(minL + margin, pt.l));
+        const poly = GamutUtils.sliceAtL(mesh, Lc);
+        if (!poly) return { isInside: false, noSlice: true };
 
-        if (mesh.geometry.index) {
-            const indices = mesh.geometry.index.array;
-            for (let i = 0; i < indices.length; i += 3) {
-                triangle.set(
-                    new THREE.Vector3().fromBufferAttribute(posAttr, indices[i]),
-                    new THREE.Vector3().fromBufferAttribute(posAttr, indices[i+1]),
-                    new THREE.Vector3().fromBufferAttribute(posAttr, indices[i+2])
-                );
-                triangle.closestPointToPoint(targetPos, tempPoint);
-                const dSq = tempPoint.distanceToSquared(targetPos);
-                if (dSq < minDistSq) { minDistSq = dSq; closestPoint.copy(tempPoint); }
+        const n = poly.length;
+        const inside = poly.every((P, i) => { const Q = poly[(i + 1) % n]; return (Q[0] - P[0]) * (pt.b - P[1]) - (Q[1] - P[1]) * (pt.a - P[0]) >= -1e-9; });
+        if (lInRange && inside) return { isInside: true };
+
+        const C = Math.hypot(pt.a, pt.b);
+        const H = Math.atan2(pt.b, pt.a);
+        const hueDeg = (rad) => { const d = rad * 180 / Math.PI; return d < 0 ? d + 360 : d; };
+        const make = (a, b) => {
+            const c2 = Math.hypot(a, b);
+            let dh = hueDeg(Math.atan2(b, a)) - hueDeg(H);
+            dh = ((dh + 540) % 360) - 180;
+            return { l: Lc, a, b, dl: Lc - pt.l, da: a - pt.a, db: b - pt.b, dC: c2 - C, dH: C < 1e-6 ? 0 : dh };
+        };
+        const wrap = (x) => { let d = x; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+
+        // L 超出範圍但 a,b 已在截面內：僅需調整 L
+        if (inside) { const same = make(pt.a, pt.b); return { isInside: false, A: same, B: same }; }
+
+        // A：與半徑 C 的圓相交的各邊交點，取色相角最近者
+        let A = null;
+        if (C > 1e-6) {
+            let bestAng = null, bestDiff = Infinity;
+            for (let i = 0; i < n; i++) {
+                const P = poly[i], Q = poly[(i + 1) % n];
+                const dx = Q[0] - P[0], dy = Q[1] - P[1];
+                const qa = dx * dx + dy * dy, qb = 2 * (P[0] * dx + P[1] * dy), qc = P[0] * P[0] + P[1] * P[1] - C * C;
+                if (qa < 1e-12) continue;
+                const disc = qb * qb - 4 * qa * qc;
+                if (disc < 0) continue;
+                const sq = Math.sqrt(disc);
+                for (const t of [(-qb - sq) / (2 * qa), (-qb + sq) / (2 * qa)]) {
+                    if (t < -1e-9 || t > 1 + 1e-9) continue;
+                    const ang = Math.atan2(P[1] + t * dy, P[0] + t * dx);
+                    const diff = Math.abs(wrap(ang - H));
+                    if (diff < bestDiff) { bestDiff = diff; bestAng = ang; }
+                }
             }
-        } else {
-            for (let i = 0; i < posAttr.count; i += 3) {
-                  triangle.set(
-                    new THREE.Vector3().fromBufferAttribute(posAttr, i),
-                    new THREE.Vector3().fromBufferAttribute(posAttr, i+1),
-                    new THREE.Vector3().fromBufferAttribute(posAttr, i+2)
-                );
-                triangle.closestPointToPoint(targetPos, tempPoint);
-                const dSq = tempPoint.distanceToSquared(targetPos);
-                if (dSq < minDistSq) { minDistSq = dSq; closestPoint.copy(tempPoint); }
-            }
+            if (bestAng !== null) A = make(C * Math.cos(bestAng), C * Math.sin(bestAng));
         }
 
-        if (minDistSq !== Infinity) {
-            return {
-                dl: (closestPoint.y - targetPoint.l).toFixed(1),
-                da: (closestPoint.x - targetPoint.a).toFixed(1),
-                db: (closestPoint.z - targetPoint.b).toFixed(1),
-                isInside: false,
-                type: 'nearest'
-            };
+        // B：沿原色相的射線與截面相交，取半徑 ≤ C 的最大值
+        let B = null;
+        if (C > 1e-6) {
+            const d = [Math.cos(H), Math.sin(H)];
+            let rLo = 0, rHi = Infinity, empty = false;
+            for (let i = 0; i < n; i++) {
+                const P = poly[i], Q = poly[(i + 1) % n];
+                const e = [Q[0] - P[0], Q[1] - P[1]];
+                const ced = e[0] * d[1] - e[1] * d[0];
+                const cep = e[0] * P[1] - e[1] * P[0];
+                if (Math.abs(ced) < 1e-12) { if (-cep < -1e-9) empty = true; }
+                else if (ced > 0) rLo = Math.max(rLo, cep / ced);
+                else rHi = Math.min(rHi, cep / ced);
+            }
+            if (!empty && rLo <= rHi + 1e-9 && rLo < C) {
+                const r = Math.min(C, rHi);
+                B = make(r * d[0], r * d[1]);
+            }
         }
-        return null;
+        return { isInside: false, A, B };
     }
 };
 
@@ -1003,24 +1032,43 @@ const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorCl
                 <button onClick={() => onDelete(point.id)} className="text-gray-300 hover:text-red-500 hover:bg-red-50 p-2.5 md:p-1.5 rounded-full transition-all"><Trash2 size={14} /></button>
             </div>
             {/* Gamut Distance Info for Test Points */}
-            {isTestPoint && point.gamutDeltas && (
-                <div className={`mt-2 rounded px-2 py-1.5 text-[10px] font-mono border flex items-center gap-2 ${point.gamutDeltas.isInside ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : 'bg-slate-50 text-slate-600 border-slate-100'}`}>
-                    {point.gamutDeltas.isInside ? (
-                        <span className="font-bold flex items-center gap-1"><div className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></div> In Gamut</span>
-                    ) : (
-                        <div className="flex flex-col w-full">
-                            <div className="flex items-center justify-between mb-0.5">
-                                <span className="font-bold text-slate-400 flex items-center gap-1"><CornerRightDown size={10}/> Correction (L-Priority)</span>
+            {isTestPoint && point.gamutDeltas && (() => {
+                const g = point.gamutDeltas;
+                const f = (v) => (v > 0 ? '+' : '') + v.toFixed(1);
+                const row = (label, hint, r) => (
+                    <div className="border-t border-slate-100 pt-1 mt-1">
+                        <div className="flex items-center justify-between text-slate-400"><span className="font-bold">{label}</span><span>{hint}</span></div>
+                        {r ? (
+                            <div className="text-slate-700">
+                                <div className="flex justify-between font-bold">
+                                    <span>L: <span className="text-blue-600">{r.l.toFixed(1)}</span></span>
+                                    <span>a: <span className="text-blue-600">{r.a.toFixed(1)}</span></span>
+                                    <span>b: <span className="text-blue-600">{r.b.toFixed(1)}</span></span>
+                                </div>
+                                <div className="flex justify-between text-slate-500">
+                                    <span>ΔL {f(r.dl)}</span><span>Δa {f(r.da)}</span><span>Δb {f(r.db)}</span>
+                                    <span>ΔC {f(r.dC)}</span><span>ΔH {f(r.dH)}°</span>
+                                </div>
                             </div>
-                            <div className="flex justify-between items-center text-slate-700 font-bold">
-                                <span>DL: <span className={Math.abs(point.gamutDeltas.dl) > 0 ? "text-blue-600" : ""}>{point.gamutDeltas.dl > 0 ? '+' : ''}{point.gamutDeltas.dl}</span></span>
-                                <span>DA: <span className={Math.abs(point.gamutDeltas.da) > 0 ? "text-blue-600" : ""}>{point.gamutDeltas.da > 0 ? '+' : ''}{point.gamutDeltas.da}</span></span>
-                                <span>DB: <span className={Math.abs(point.gamutDeltas.db) > 0 ? "text-blue-600" : ""}>{point.gamutDeltas.db > 0 ? '+' : ''}{point.gamutDeltas.db}</span></span>
+                        ) : <div className="text-slate-400">N/A（此條件下沒有解）</div>}
+                    </div>
+                );
+                return (
+                    <div className={`mt-2 rounded px-2 py-1.5 text-[10px] font-mono border ${g.isInside ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : 'bg-slate-50 text-slate-600 border-slate-100'}`}>
+                        {g.isInside ? (
+                            <span className="font-bold flex items-center gap-1"><div className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></div> In Gamut</span>
+                        ) : g.noSlice ? (
+                            <span className="font-bold text-slate-500">Out of Gamut（此 L 無法計算截面）</span>
+                        ) : (
+                            <div className="flex flex-col w-full">
+                                <span className="font-bold text-orange-600 flex items-center gap-1"><CornerRightDown size={10}/> Out of Gamut — Correction A & B</span>
+                                {row('A', 'Chroma 維持・調整 Hue', g.A)}
+                                {row('B', 'Hue 維持・降低 Chroma', g.B)}
                             </div>
-                        </div>
-                    )}
-                </div>
-            )}
+                        )}
+                    </div>
+                );
+            })()}
         </div>
     );
 };
@@ -1283,7 +1331,7 @@ function App() {
         }
         // Gamut Delta
         if (gamutMesh) {
-            processed.gamutDeltas = GamutUtils.calculateClosestDeltas(p, gamutMesh);
+            processed.gamutDeltas = GamutUtils.calculateCorrections(p, gamutMesh);
         }
         return processed; 
     });
