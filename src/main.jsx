@@ -1180,7 +1180,7 @@ const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorCl
                 const f = (v) => (v > 0 ? '+' : '') + v.toFixed(1);
                 const row = (label, hint, r, accent) => (
                     <div className="border-t border-slate-100 pt-1 mt-1">
-                        <div className="flex items-center justify-between text-slate-400"><span className="font-bold flex items-center gap-1.5" style={{ color: accent }}><span className="inline-block w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: accent }} />{label}</span><span>{hint}</span></div>
+                        <div className="flex items-center justify-between text-slate-400"><span className="font-bold flex items-center gap-1.5" style={{ color: accent }}><span className="inline-block w-5 h-5 rounded border border-gray-300 shrink-0" title={r ? `L ${r.l.toFixed(1)} a ${r.a.toFixed(1)} b ${r.b.toFixed(1)}` : 'N/A'} style={{ background: r ? ColorUtils.labToHex(r.l, r.a, r.b) : 'transparent', borderStyle: r ? 'solid' : 'dashed' }} />{label}</span><span>{hint}</span></div>
                         {r ? (
                             <div className="text-slate-700">
                                 <div className="flex justify-between font-bold">
