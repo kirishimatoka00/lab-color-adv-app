@@ -1,0 +1,1142 @@
+import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { createRoot } from 'react-dom/client';
+import { Canvas, useThree } from '@react-three/fiber';
+import { OrbitControls, MapControls, Text, Html, Billboard } from '@react-three/drei';
+import * as THREE from 'three';
+import * as XLSX from '@e965/xlsx';
+import './index.css';
+import { ConvexGeometry } from 'three/examples/jsm/geometries/ConvexGeometry';
+import { Plus, Trash2, RotateCcw, Info, Box, Camera, Maximize, Minimize, Tag, Eye, EyeOff, LayoutTemplate, Square, Circle, Target, X, Aperture, Upload, Image as ImageIcon, CornerRightDown, FileSpreadsheet, Download, CheckSquare as CheckSquareIcon, SlidersHorizontal, Sun, Droplet, List } from 'lucide-react';
+import { Capacitor } from '@capacitor/core';
+import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
+import robotoFontUrl from '@fontsource/roboto/files/roboto-latin-700-normal.woff?url';
+
+// 3D 標籤字型改用本機打包的檔案（drei 預設會從網路 CDN 下載，離線時整個畫布會卡住）
+const LABEL_FONT = new URL(robotoFontUrl, document.baseURI).href;
+
+/**
+ * 檔案儲存：
+ * - Android APK（Capacitor 原生）：WebView 不支援 <a download>，改為寫入快取後呼叫系統分享面板
+ *   （可選擇「儲存到雲端硬碟 / 檔案」、LINE、Email 等）。
+ * - 一般瀏覽器：沿用原本的下載行為。
+ * dataBase64 為不含 data: 前綴的 base64 字串。
+ */
+const saveFile = async (fileName, dataBase64, mimeType) => {
+    if (Capacitor.isNativePlatform()) {
+        const written = await Filesystem.writeFile({ path: fileName, data: dataBase64, directory: Directory.Cache });
+        await Share.share({ title: fileName, url: written.uri, dialogTitle: fileName });
+        return;
+    }
+    const bytes = Uint8Array.from(atob(dataBase64), c => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+    const link = document.createElement('a');
+    link.download = fileName;
+    link.href = url;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+/**
+ * Math & Color Utility Functions
+ */
+const ColorUtils = {
+    clamp: (num, min, max) => Math.min(Math.max(num, min), max),
+
+    // Lab to XYZ
+    labToXyz: (l, a, b) => {
+        let y = (l + 16) / 116;
+        let x = a / 500 + y;
+        let z = y - b / 200;
+
+        const targetX = 0.95047;
+        const targetY = 1.00000;
+        const targetZ = 1.08883;
+
+        const pow3 = (v) => {
+            return (v > 0.206893034) ? v * v * v : (v - 16 / 116) / 7.787;
+        };
+
+        const X = targetX * pow3(x);
+        const Y = targetY * pow3(y);
+        const Z = targetZ * pow3(z);
+
+        return [X, Y, Z];
+    },
+
+    // XYZ to Linear RGB
+    xyzToRgbLinear: (x, y, z) => {
+        const rLinear = x * 3.2406 + y * -1.5372 + z * -0.4986;
+        const gLinear = x * -0.9689 + y * 1.8758 + z * 0.0415;
+        const bLinear = x * 0.0557 + y * -0.2040 + z * 1.0570;
+        return [rLinear, gLinear, bLinear];
+    },
+
+    // XYZ to RGB (sRGB) [0-255]
+    xyzToRgb: (x, y, z) => {
+        const [rL, gL, bL] = ColorUtils.xyzToRgbLinear(x, y, z);
+        
+        const adjust = (v) => {
+            return v > 0.0031308
+                ? 1.055 * Math.pow(v, 1.0 / 2.4) - 0.055
+                : 12.92 * v;
+        };
+
+        const R = Math.round(ColorUtils.clamp(adjust(rL), 0, 1) * 255);
+        const G = Math.round(ColorUtils.clamp(adjust(gL), 0, 1) * 255);
+        const B = Math.round(ColorUtils.clamp(adjust(bL), 0, 1) * 255);
+
+        return `rgb(${R}, ${G}, ${B})`;
+    },
+
+    // RGB (0-255) to Lab
+    rgbToLab: (r, g, b) => {
+        let R = r / 255;
+        let G = g / 255;
+        let B = b / 255;
+
+        R = (R > 0.04045) ? Math.pow((R + 0.055) / 1.055, 2.4) : R / 12.92;
+        G = (G > 0.04045) ? Math.pow((G + 0.055) / 1.055, 2.4) : G / 12.92;
+        B = (B > 0.04045) ? Math.pow((B + 0.055) / 1.055, 2.4) : B / 12.92;
+
+        let X = R * 0.4124 + G * 0.3576 + B * 0.1805;
+        let Y = R * 0.2126 + G * 0.7152 + B * 0.0722;
+        let Z = R * 0.0193 + G * 0.1192 + B * 0.9505;
+
+        const refX = 0.95047;
+        const refY = 1.00000;
+        const refZ = 1.08883;
+
+        X = X / refX;
+        Y = Y / refY;
+        Z = Z / refZ;
+
+        const f = (val) => (val > 0.008856) ? Math.pow(val, 1/3) : (7.787 * val) + (16/116);
+
+        const fx = f(X);
+        const fy = f(Y);
+        const fz = f(Z);
+
+        const L = (116 * fy) - 16;
+        const a = 500 * (fx - fy);
+        const B_lab = 200 * (fy - fz);
+
+        return {
+            l: Math.round(L * 10) / 10,
+            a: Math.round(a * 10) / 10,
+            b: Math.round(B_lab * 10) / 10
+        };
+    },
+
+    // Helper: Lab to [r,g,b] normalized (0-1)
+    labToRgbNormalized: (l, a, b) => {
+        const [x, y, z] = ColorUtils.labToXyz(l, a, b);
+        const [rL, gL, bL] = ColorUtils.xyzToRgbLinear(x, y, z);
+        
+        const adjust = (v) => {
+            return v > 0.0031308
+                ? 1.055 * Math.pow(v, 1.0 / 2.4) - 0.055
+                : 12.92 * v;
+        };
+
+        return [
+            ColorUtils.clamp(adjust(rL), 0, 1),
+            ColorUtils.clamp(adjust(gL), 0, 1),
+            ColorUtils.clamp(adjust(bL), 0, 1)
+        ];
+    },
+
+    labToHex: (l, a, b) => {
+        const [x, y, z] = ColorUtils.labToXyz(l, a, b);
+        return ColorUtils.xyzToRgb(x, y, z);
+    },
+
+    calculateDeltaE: (p1, p2) => {
+        const dL = p1.l - p2.l;
+        const da = p1.a - p2.a;
+        const db = p1.b - p2.b;
+        return Math.sqrt(dL * dL + da * da + db * db).toFixed(2);
+    }
+};
+
+/**
+ * Gamut Calculation Utilities
+ */
+const GamutUtils = {
+    // Calculate closest deltas to the gamut volume
+    calculateClosestDeltas: (targetPoint, mesh) => {
+        if (!mesh || !mesh.geometry) return null;
+        if (!targetPoint) return null;
+
+        // In our scene: X=a, Y=l, Z=b
+        const targetPos = new THREE.Vector3(targetPoint.a, targetPoint.l, targetPoint.b);
+
+        // 1. Raycast for L-priority (Vertical line test)
+        const raycaster = new THREE.Raycaster();
+        const rayOrigin = new THREE.Vector3(targetPoint.a, 1000, targetPoint.b);
+        const rayDir = new THREE.Vector3(0, -1, 0); // Downwards along L (Y axis)
+        raycaster.set(rayOrigin, rayDir);
+
+        mesh.updateMatrixWorld();
+        const intersects = raycaster.intersectObject(mesh, false);
+
+        if (intersects.length > 0) {
+            // Collect all hits (both entry and exit points due to DoubleSide material)
+            const hitLs = intersects.map(hit => hit.point.y).sort((a, b) => a - b);
+            const minL = hitLs[0];
+            const maxL = hitLs[hitLs.length - 1];
+            const currentL = targetPoint.l;
+
+            if (currentL >= minL && currentL <= maxL) {
+                return { dl: 0, da: 0, db: 0, isInside: true, type: 'inside' };
+            } else {
+                const diffMin = Math.abs(currentL - minL);
+                const diffMax = Math.abs(currentL - maxL);
+                let targetL;
+                if (diffMin < diffMax) targetL = minL;
+                else targetL = maxL;
+                return { dl: (targetL - currentL).toFixed(1), da: 0, db: 0, isInside: false, type: 'l-only' };
+            }
+        }
+
+        // 2. Nearest point on surface
+        const posAttr = mesh.geometry.attributes.position;
+        const triangle = new THREE.Triangle();
+        let minDistSq = Infinity;
+        let closestPoint = new THREE.Vector3();
+        const tempPoint = new THREE.Vector3();
+
+        if (mesh.geometry.index) {
+            const indices = mesh.geometry.index.array;
+            for (let i = 0; i < indices.length; i += 3) {
+                triangle.set(
+                    new THREE.Vector3().fromBufferAttribute(posAttr, indices[i]),
+                    new THREE.Vector3().fromBufferAttribute(posAttr, indices[i+1]),
+                    new THREE.Vector3().fromBufferAttribute(posAttr, indices[i+2])
+                );
+                triangle.closestPointToPoint(targetPos, tempPoint);
+                const dSq = tempPoint.distanceToSquared(targetPos);
+                if (dSq < minDistSq) { minDistSq = dSq; closestPoint.copy(tempPoint); }
+            }
+        } else {
+            for (let i = 0; i < posAttr.count; i += 3) {
+                  triangle.set(
+                    new THREE.Vector3().fromBufferAttribute(posAttr, i),
+                    new THREE.Vector3().fromBufferAttribute(posAttr, i+1),
+                    new THREE.Vector3().fromBufferAttribute(posAttr, i+2)
+                );
+                triangle.closestPointToPoint(targetPos, tempPoint);
+                const dSq = tempPoint.distanceToSquared(targetPos);
+                if (dSq < minDistSq) { minDistSq = dSq; closestPoint.copy(tempPoint); }
+            }
+        }
+
+        if (minDistSq !== Infinity) {
+            return {
+                dl: (closestPoint.y - targetPoint.l).toFixed(1),
+                da: (closestPoint.x - targetPoint.a).toFixed(1),
+                db: (closestPoint.z - targetPoint.b).toFixed(1),
+                isInside: false,
+                type: 'nearest'
+            };
+        }
+        return null;
+    }
+};
+
+/**
+ * Camera Color Picker
+ */
+const CameraPicker = ({ onCapture, onClose }) => {
+    const videoRef = useRef(null);
+    const canvasRef = useRef(null);
+    const imgRef = useRef(null);
+    const fileInputRef = useRef(null);
+
+    const [color, setColor] = useState({ r: 0, g: 0, b: 0 });
+    const [lab, setLab] = useState({ l: 0, a: 0, b: 0 });
+    const [stream, setStream] = useState(null);
+    const [error, setError] = useState('');
+    const [imageMode, setImageMode] = useState(false);
+    const [uploadedImgSrc, setUploadedImgSrc] = useState(null);
+    const [pointerPos, setPointerPos] = useState(null);
+    const [isLocalFile, setIsLocalFile] = useState(window.location.protocol === 'file:');
+
+    useEffect(() => {
+        const startCamera = async () => {
+            if (isLocalFile) {
+                setError("Browser Security Restriction: Local files (file://) cannot access camera directly.\nPlease use the 'Album/Photo' button below.");
+                return;
+            }
+            try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error("Browser API not supported");
+                }
+                const s = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' },
+                    audio: false
+                });
+                setStream(s);
+                if (videoRef.current) {
+                    videoRef.current.srcObject = s;
+                }
+            } catch (err) {
+                console.warn("Camera access failed", err);
+                setError("Cannot start camera. Reasons might be:\n1. Browser security (HTTPS required)\n2. Permission denied\nPlease use 'Album/Photo' button.");
+            }
+        };
+        if (!imageMode) startCamera();
+        return () => { if (stream) stream.getTracks().forEach(track => track.stop()); };
+    }, [imageMode, isLocalFile]);
+
+    useEffect(() => {
+        if (!stream || imageMode) return;
+        const interval = setInterval(() => {
+            if (videoRef.current && canvasRef.current) {
+                const video = videoRef.current;
+                const canvas = canvasRef.current;
+                const context = canvas.getContext('2d');
+                if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    const centerX = Math.floor(canvas.width / 2);
+                    const centerY = Math.floor(canvas.height / 2);
+                    const pixelData = context.getImageData(centerX, centerY, 1, 1).data;
+                    const r = pixelData[0]; const g = pixelData[1]; const b = pixelData[2];
+                    setColor({ r, g, b });
+                    setLab(ColorUtils.rgbToLab(r, g, b));
+                }
+            }
+        }, 100);
+        return () => clearInterval(interval);
+    }, [stream, imageMode]);
+
+    const handleCaptureClick = () => { onCapture(lab); onClose(); };
+    const triggerFileInput = () => fileInputRef.current && fileInputRef.current.click();
+    const handleFileUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                setUploadedImgSrc(evt.target.result);
+                setImageMode(true);
+                setError('');
+                if (stream) { stream.getTracks().forEach(track => track.stop()); setStream(null); }
+            };
+            reader.readAsDataURL(file);
+        }
+    };
+    const handleImageClick = (e) => {
+        if (!imgRef.current || !canvasRef.current) return;
+        const img = imgRef.current;
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        ctx.drawImage(img, 0, 0);
+        const rect = img.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const scaleX = img.naturalWidth / rect.width;
+        const scaleY = img.naturalHeight / rect.height;
+        const naturalX = Math.floor(x * scaleX);
+        const naturalY = Math.floor(y * scaleY);
+        const pixelData = ctx.getImageData(naturalX, naturalY, 1, 1).data;
+        const r = pixelData[0]; const g = pixelData[1]; const b = pixelData[2];
+        setColor({ r, g, b });
+        setLab(ColorUtils.rgbToLab(r, g, b));
+        setPointerPos({ x: e.clientX, y: e.clientY });
+    };
+
+    return (
+        <div className="fixed inset-0 z-50 bg-black flex flex-col" style={{ paddingTop: 'env(safe-area-inset-top)' }}>
+            <div className="relative flex-1 bg-black flex items-center justify-center overflow-hidden">
+                {imageMode ? (
+                    <div className="relative w-full h-full flex items-center justify-center bg-gray-900 cursor-crosshair">
+                        <img ref={imgRef} src={uploadedImgSrc} className="max-w-full max-h-full object-contain" onClick={handleImageClick} alt="Uploaded" />
+                        {pointerPos && (
+                            <div className="fixed w-8 h-8 border-2 border-white rounded-full pointer-events-none transform -translate-x-1/2 -translate-y-1/2 shadow-[0_0_10px_rgba(0,0,0,0.8)]" style={{ left: pointerPos.x, top: pointerPos.y, backgroundColor: `rgb(${color.r},${color.g},${color.b})` }}></div>
+                        )}
+                        <div className="absolute top-6 bg-black/70 text-white px-4 py-2 rounded-full text-sm pointer-events-none backdrop-blur-md shadow-lg border border-white/10">👆 Tap anywhere to pick color</div>
+                    </div>
+                ) : (
+                    <>
+                        {error ? (
+                            <div className="text-white p-8 text-center max-w-sm flex flex-col items-center animate-pulse">
+                                <Camera size={64} className="mb-6 text-gray-500 opacity-80" />
+                                <p className="font-bold mb-3 text-xl">Camera Mode</p>
+                                <p className="text-sm text-gray-400 mb-8 whitespace-pre-line leading-relaxed">{error}</p>
+                                <button onClick={triggerFileInput} className="bg-blue-600 hover:bg-blue-500 active:scale-95 text-white px-8 py-4 rounded-full font-bold flex items-center gap-3 shadow-xl transition-all"><ImageIcon size={24} /> Album / Camera</button>
+                            </div>
+                        ) : (
+                            <>
+                                <video ref={videoRef} autoPlay playsInline className="absolute w-full h-full object-cover" />
+                                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                    <div className="w-16 h-16 border-2 border-white/70 rounded-full flex items-center justify-center shadow-lg"><div className="w-1 h-6 bg-white/90"></div><div className="h-1 w-6 bg-white/90 absolute"></div></div>
+                                </div>
+                                <div className="absolute top-6 left-0 right-0 text-center pointer-events-none"><span className="bg-black/60 text-white/90 px-4 py-1.5 rounded-full text-xs backdrop-blur-sm border border-white/10">⚠ Values affected by lighting, for reference only</span></div>
+                            </>
+                        )}
+                    </>
+                )}
+                <canvas ref={canvasRef} className="hidden" />
+                <input ref={fileInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFileUpload} />
+            </div>
+            <div className="bg-gray-900 p-5 flex flex-col gap-5 border-t border-gray-800" style={{ paddingBottom: 'max(2.5rem, calc(env(safe-area-inset-bottom) + 1rem))' }}>
+                <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-4">
+                        <div className="w-14 h-14 rounded-full border-2 border-white shadow-lg transition-colors duration-200" style={{ backgroundColor: `rgb(${color.r}, ${color.g}, ${color.b})` }}></div>
+                        <div className="flex flex-col text-white">
+                            <span className="text-xs text-gray-400 font-mono tracking-wider">RGB: {color.r}, {color.g}, {color.b}</span>
+                            <span className="font-mono font-bold text-xl text-yellow-400 tracking-tight">L{lab.l} a{lab.a} b{lab.b}</span>
+                        </div>
+                    </div>
+                </div>
+                <div className="grid grid-cols-3 gap-4">
+                    <button onClick={onClose} className="bg-gray-800 active:bg-gray-700 text-white py-3.5 rounded-xl font-bold text-sm transition-colors">Cancel</button>
+                    <button onClick={triggerFileInput} className="bg-gray-800 active:bg-gray-700 text-white py-3.5 rounded-xl font-bold flex items-center justify-center gap-2 cursor-pointer text-sm transition-colors"><ImageIcon size={18} /><span>Album</span></button>
+                    <button onClick={handleCaptureClick} className="bg-blue-600 active:bg-blue-500 text-white py-3.5 rounded-xl font-bold flex items-center justify-center gap-2 text-sm transition-colors shadow-lg shadow-blue-900/30"><CheckSquare size={18} /><span>Confirm</span></button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// 3D/2D Components
+const AxesSystem3D = () => (
+    <group>
+        <line><bufferGeometry attach="geometry" {...new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 210, 0)])} /><lineBasicMaterial attach="material" color="#888" opacity={0.5} transparent /></line>
+        <Billboard position={[0, 215, 0]}><Text font={LABEL_FONT} fontSize={4} color="black" outlineWidth={0.2} outlineColor="white">L</Text></Billboard>
+        <line><bufferGeometry attach="geometry" {...new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-200, 0, 0), new THREE.Vector3(200, 0, 0)])} /><lineBasicMaterial attach="material" color="#ff0000" opacity={0.3} transparent /></line>
+        <Billboard position={[210, 0, 0]}><Text font={LABEL_FONT} fontSize={4} color="#cc0000" outlineWidth={0.2} outlineColor="white">+a</Text></Billboard>
+        <Billboard position={[-210, 0, 0]}><Text font={LABEL_FONT} fontSize={4} color="#00aa00" outlineWidth={0.2} outlineColor="white">-a</Text></Billboard>
+        <line><bufferGeometry attach="geometry" {...new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, -200), new THREE.Vector3(0, 0, 200)])} /><lineBasicMaterial attach="material" color="#0000ff" opacity={0.3} transparent /></line>
+        <Billboard position={[0, 0, 210]}><Text font={LABEL_FONT} fontSize={4} color="#aaaa00" outlineWidth={0.2} outlineColor="white">+b</Text></Billboard>
+        <Billboard position={[0, 0, -210]}><Text font={LABEL_FONT} fontSize={4} color="#0000cc" outlineWidth={0.2} outlineColor="white">-b</Text></Billboard>
+    </group>
+);
+
+const AxesSystem2D = () => (
+    <group>
+        <line><bufferGeometry attach="geometry" {...new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-200, 0, 0), new THREE.Vector3(200, 0, 0)])} /><lineBasicMaterial attach="material" color="#ff0000" opacity={0.5} transparent /></line>
+        <Text font={LABEL_FONT} position={[210, 0, 0]} fontSize={4} color="#cc0000" outlineWidth={0.2} outlineColor="white">+a</Text>
+        <Text font={LABEL_FONT} position={[-210, 0, 0]} fontSize={4} color="#00aa00" outlineWidth={0.2} outlineColor="white">-a</Text>
+        <line><bufferGeometry attach="geometry" {...new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, -200, 0), new THREE.Vector3(0, 200, 0)])} /><lineBasicMaterial attach="material" color="#0000ff" opacity={0.5} transparent /></line>
+        <Text font={LABEL_FONT} position={[0, 210, 0]} fontSize={4} color="#aaaa00" outlineWidth={0.2} outlineColor="white">+b</Text>
+        <Text font={LABEL_FONT} position={[0, -210, 0]} fontSize={4} color="#0000cc" outlineWidth={0.2} outlineColor="white">-b</Text>
+    </group>
+);
+
+const LabPoint = ({ l, a, b, name, isTestPoint = false, id, showLabels, typeLabel, mode = '3d', deltaE, isStandard }) => {
+    const color = ColorUtils.labToHex(l, a, b);
+    const position = mode === '2d' ? [a, b, 0] : [a, l, b];
+    const [hovered, setHover] = useState(false);
+    const hasName = name && name.trim().length > 0;
+    const labelVisible = showLabels && (hasName || isTestPoint);
+    let defaultLabel = isTestPoint ? "Test" : (typeLabel || "Pt");
+    let labelText = hasName ? name : defaultLabel;
+    if (isStandard) labelText += " (Std)";
+    else if (deltaE) labelText += ` (ΔE: ${deltaE})`;
+
+    return (
+        <group position={position}>
+            <mesh onPointerOver={(e) => { e.stopPropagation(); setHover(true); }} onPointerOut={(e) => setHover(false)}>
+                {isTestPoint ? <boxGeometry args={[5, 5, 5]} /> : <sphereGeometry args={[3, 32, 32]} />}
+                <meshStandardMaterial color={color} emissive={isStandard ? "#ffff00" : (isTestPoint ? "#ffffff" : "#000000")} emissiveIntensity={isStandard ? 0.3 : (isTestPoint && hovered ? 0.5 : 0)} />
+                {isTestPoint && <lineSegments><edgesGeometry args={[new THREE.BoxGeometry(5, 5, 5)]} /><lineBasicMaterial color={isStandard ? "#ffff00" : "white"} opacity={isStandard ? 0.8 : 0.5} transparent /></lineSegments>}
+                {isStandard && <lineSegments rotation={[mode === '2d' ? 0 : Math.PI/2, 0, 0]}><edgesGeometry args={[new THREE.CylinderGeometry(6, 6, 0.5, 16)]} /><lineBasicMaterial color="#ffff00" /></lineSegments>}
+            </mesh>
+            {labelVisible && labelText && (
+                mode === '3d' ? <Billboard position={[0, 6, 0]}><Text font={LABEL_FONT} fontSize={3} color={isTestPoint ? "#d8b4fe" : "white"} outlineWidth={0.15} outlineColor="black" anchorY="bottom">{labelText}</Text></Billboard> 
+                : <Text font={LABEL_FONT} position={[0, 6, 0]} fontSize={3} color={isTestPoint ? "#581c87" : "#1e293b"} outlineWidth={0.2} outlineColor="white" anchorY="bottom">{labelText}</Text>
+            )}
+            {/* Fixed: Conditional distanceFactor logic to prevent huge scaling in 2D/Orthographic view */}
+            <Html distanceFactor={mode === '2d' ? undefined : 200} zIndexRange={[100, 0]} style={{ pointerEvents: 'none', opacity: hovered ? 1 : 0, transition: 'opacity 0.2s' }}>
+                <div className={`tooltip-animate px-2 py-1 rounded text-xs whitespace-nowrap border shadow-xl transform -translate-x-1/2 -translate-y-full mt-[-10px] ${isTestPoint ? 'bg-purple-900 text-white border-purple-500' : 'bg-gray-800 text-white border-gray-600'}`}>
+                    <strong>{name || defaultLabel} {isStandard ? "(Standard)" : ""}</strong><br/>L:{l} a:{a} b:{b}<br/>{deltaE && <span className="text-yellow-300">ΔE: {deltaE}</span>}
+                </div>
+            </Html>
+        </group>
+    );
+};
+
+const GamutVolume = ({ points, mode = '3d', colorL = 50, autoL = true, opacity = 0.6 }) => {
+    const { geometry } = useMemo(() => {
+        if (points.length < 3) return { geometry: null };
+        const vectors = [];
+        // Fix for 2D Sync: Ensure 2D hull has volume by duplicating points with +/- Z
+        if (mode === '2d') {
+            points.forEach(p => {
+                vectors.push(new THREE.Vector3(p.a, p.b, 0.1));
+                vectors.push(new THREE.Vector3(p.a, p.b, -0.1));
+            });
+        } else {
+            points.forEach(p => {
+                vectors.push(new THREE.Vector3(p.a, p.l, p.b));
+            });
+        }
+        
+        let geo;
+        try {
+            geo = new ConvexGeometry(vectors);
+            const count = geo.attributes.position.count;
+            const colors = [];
+            const pos = geo.attributes.position;
+            for(let i = 0; i < count; i++) {
+                const x = pos.getX(i); const y = pos.getY(i); const z = pos.getZ(i);
+                let minD = Infinity; let closest = points[0];
+                for(let p of points) {
+                    let d;
+                    if (mode === '2d') d = (p.a - x)**2 + (p.b - y)**2;
+                    else d = (p.a - x)**2 + (p.l - y)**2 + (p.b - z)**2;
+                    if(d < minD) { minD = d; closest = p; }
+                }
+                // L value used for gamut surface coloring: either each facet's own nearest-point L (auto),
+                // or a single user-adjustable L value applied uniformly (manual).
+                const useL = autoL ? closest.l : colorL;
+                const rgb = ColorUtils.labToRgbNormalized(useL, closest.a, closest.b);
+                colors.push(rgb[0], rgb[1], rgb[2]);
+            }
+            geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        } catch (e) { return { geometry: null }; }
+        return { geometry: geo };
+    }, [points, mode, autoL, colorL]);
+    if (!geometry) return null;
+    return <group><mesh geometry={geometry}><meshBasicMaterial vertexColors={true} transparent={true} opacity={opacity} side={THREE.DoubleSide} depthWrite={false} /></mesh></group>;
+};
+
+/**
+ * Draggable slider control (pointer-drag adjustable), used for Gamut L / Opacity controls.
+ */
+const DragSlider = ({ label, value, min, max, step = 1, onChange, unit = '', accent = '#3b82f6', disabled = false, formatValue }) => {
+    const trackRef = useRef(null);
+    const draggingRef = useRef(false);
+
+    const pct = ColorUtils.clamp((value - min) / (max - min), 0, 1) * 100;
+
+    const updateFromClientX = (clientX) => {
+        if (!trackRef.current) return;
+        const rect = trackRef.current.getBoundingClientRect();
+        const ratio = ColorUtils.clamp((clientX - rect.left) / rect.width, 0, 1);
+        let raw = min + ratio * (max - min);
+        raw = Math.round(raw / step) * step;
+        raw = ColorUtils.clamp(raw, min, max);
+        onChange(parseFloat(raw.toFixed(4)));
+    };
+
+    const handlePointerDown = (e) => {
+        if (disabled) return;
+        draggingRef.current = true;
+        e.currentTarget.setPointerCapture && e.currentTarget.setPointerCapture(e.pointerId);
+        updateFromClientX(e.clientX);
+    };
+    const handlePointerMove = (e) => {
+        if (!draggingRef.current || disabled) return;
+        updateFromClientX(e.clientX);
+    };
+    const handlePointerUp = (e) => {
+        draggingRef.current = false;
+        e.currentTarget.releasePointerCapture && e.currentTarget.releasePointerCapture(e.pointerId);
+    };
+
+    return (
+        <div className={`select-none transition-opacity ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}>
+            <div className="flex justify-between items-center mb-1.5">
+                <span className="text-[11px] font-bold text-white/70 uppercase tracking-wider">{label}</span>
+                <span className="text-xs font-mono font-bold text-white bg-white/10 px-1.5 py-0.5 rounded">{formatValue ? formatValue(value) : value}{unit}</span>
+            </div>
+            <div
+                ref={trackRef}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={handlePointerUp}
+                className={`relative h-5 flex items-center touch-none ${disabled ? 'pointer-events-none cursor-not-allowed' : 'cursor-pointer'}`}
+                style={{ touchAction: 'none' }}
+            >
+                <div className="absolute left-0 right-0 h-1.5 rounded-full bg-white/15" />
+                <div className="absolute left-0 h-1.5 rounded-full" style={{ width: `${pct}%`, backgroundColor: disabled ? '#6b7280' : accent }} />
+                <div
+                    className="absolute w-4 h-4 rounded-full shadow-lg border-2 border-white -translate-x-1/2"
+                    style={{ left: `${pct}%`, backgroundColor: disabled ? '#6b7280' : accent }}
+                />
+            </div>
+        </div>
+    );
+};
+
+const ToggleSwitch = ({ checked, onChange, disabled = false }) => (
+    <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        disabled={disabled}
+        onClick={() => !disabled && onChange(!checked)}
+        className={`relative inline-flex items-center w-9 h-5 rounded-full shrink-0 transition-colors duration-200 ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'} ${checked ? 'bg-blue-600' : 'bg-white/20'}`}
+    >
+        <span
+            className={`absolute left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform duration-200 ${checked ? 'translate-x-4' : 'translate-x-0'}`}
+        />
+    </button>
+);
+
+const GamutDisplayPanel = ({ open, onClose, autoL, setAutoL, colorL, setColorL, opacity, setOpacity }) => {
+    if (!open) return null;
+    return (
+        <div className="absolute top-14 right-4 z-30 w-64 bg-[#26262e]/95 backdrop-blur-md border border-white/10 rounded-xl shadow-2xl p-4 space-y-4 tooltip-animate">
+            <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                <div className="flex items-center gap-2 text-white text-xs font-bold uppercase tracking-wider"><SlidersHorizontal size={14} /> Gamut Display</div>
+                <button onClick={onClose} className="text-white/40 hover:text-white transition-colors"><X size={16} /></button>
+            </div>
+
+            <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold text-white/70 uppercase tracking-wider flex items-center gap-1.5"><Sun size={12}/> Auto L (per-facet)</span>
+                <ToggleSwitch checked={autoL} onChange={setAutoL} />
+            </div>
+
+            <DragSlider
+                label="Gamut Color L"
+                value={colorL}
+                min={0}
+                max={100}
+                step={1}
+                onChange={setColorL}
+                accent="#f59e0b"
+                disabled={autoL}
+            />
+
+            <DragSlider
+                label="Opacity"
+                value={opacity}
+                min={0.05}
+                max={1}
+                step={0.01}
+                onChange={setOpacity}
+                accent="#22c55e"
+                formatValue={(v) => Math.round(v * 100)}
+                unit="%"
+            />
+
+            <p className="text-[10px] text-white/40 leading-relaxed pt-1 border-t border-white/10">
+                {autoL ? 'Each gamut facet is colored using its own nearest point\u2019s L value.' : 'A fixed L value is applied across the whole gamut surface color.'}
+            </p>
+        </div>
+    );
+};
+
+const ViewContainer = ({ children, title, onFullscreen, onCapture, onToggleLabels, showLabels }) => {
+    // 以 CSS 方式放大到整個畫面（瀏覽器 Fullscreen API 在 Android WebView 內不可靠）
+    const [expanded, setExpanded] = useState(false);
+    const btn = "p-2.5 md:p-2 bg-black/40 hover:bg-white/10 text-white/70 backdrop-blur-md rounded-lg shadow-lg border border-white/10 transition-all active:scale-95";
+    return (
+        <div
+            className={`${expanded ? 'fixed inset-0 z-[60]' : 'relative w-full h-full'} bg-[#1e1e24] overflow-hidden group border-b border-white/5 last:border-0`}
+            style={{ touchAction: 'none', ...(expanded ? { paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' } : {}) }}
+        >
+            <div className="absolute top-3 left-3 md:top-4 md:left-4 z-20 pointer-events-none select-none"><div className="bg-black/40 backdrop-blur-md text-white/90 text-xs md:text-sm font-bold px-3 py-1.5 rounded-lg border border-white/10 shadow-lg">{title}</div></div>
+            <div className="absolute top-3 right-3 md:top-4 md:right-4 z-20 flex flex-col gap-2 opacity-90 transition-opacity" style={expanded ? { marginTop: 'env(safe-area-inset-top)' } : undefined}>
+                <button onClick={onToggleLabels} aria-label="Toggle labels" className={`p-2.5 md:p-2 rounded-lg shadow-lg backdrop-blur-md border transition-all active:scale-95 ${showLabels ? 'bg-blue-600 text-white border-blue-500' : 'bg-black/40 text-white/70 border-white/10 hover:bg-white/10'}`}><Tag size={18} /></button>
+                <button onClick={onCapture} aria-label="Save screenshot" className={btn}><Camera size={18} /></button>
+                <button onClick={() => setExpanded(v => !v)} aria-label={expanded ? 'Exit full screen' : 'Full screen'} className={btn}>{expanded ? <Minimize size={18} /> : <Maximize size={18} />}</button>
+            </div>
+            {children}
+        </div>
+    );
+};
+
+const ScreenshotHandler = ({ captureRef }) => {
+    const { gl, scene, camera } = useThree();
+    useEffect(() => {
+        if (captureRef) {
+            captureRef.current = async () => {
+                const originalSize = new THREE.Vector2(); gl.getSize(originalSize); const originalAspect = camera.aspect;
+                gl.setSize(1200, 1200); if (!camera.isOrthographicCamera) { camera.aspect = 1; camera.updateProjectionMatrix(); }
+                gl.render(scene, camera); const dataUrl = gl.domElement.toDataURL('image/png');
+                gl.setSize(originalSize.width, originalSize.height); if (!camera.isOrthographicCamera) { camera.aspect = originalAspect; } camera.updateProjectionMatrix(); gl.render(scene, camera);
+                try {
+                    await saveFile(`lab-view-${Date.now()}.png`, dataUrl.split(',')[1], 'image/png');
+                } catch (err) { console.warn('Screenshot save failed', err); }
+            };
+        }
+    }, [gl, scene, camera, captureRef]);
+    return null;
+};
+
+const Scene3D = ({ basePoints, historyPoints, testPoints, captureRef, showLabels, gamutColorL, gamutAutoL, gamutOpacity }) => {
+    const gamutPoints = useMemo(() => [...basePoints.filter(p=>p.visible!==false), ...historyPoints.filter(p=>p.visible!==false)], [basePoints, historyPoints]);
+    const renderBase = useMemo(() => basePoints.filter(p => p.showPoint !== false), [basePoints]);
+    const renderHistory = useMemo(() => historyPoints.filter(p => p.showPoint !== false), [historyPoints]);
+    const renderTest = useMemo(() => testPoints.filter(p => p.showPoint !== false), [testPoints]);
+    return (
+        <>
+            <ScreenshotHandler captureRef={captureRef} />
+            <ambientLight intensity={1.5} />
+            <pointLight position={[200, 200, 200]} intensity={1} />
+            <pointLight position={[-200, -200, -200]} intensity={0.5} />
+            <OrbitControls makeDefault target={[0, 50, 0]} dampingFactor={0.1} />
+            <AxesSystem3D />
+            {renderBase.map((p) => <LabPoint key={p.id} {...p} mode="3d" showLabels={showLabels} typeLabel="Base" />)}
+            {renderHistory.map((p) => <LabPoint key={p.id} {...p} mode="3d" showLabels={showLabels} typeLabel="Hist" />)}
+            {renderTest.map((p) => <LabPoint key={p.id} {...p} mode="3d" isTestPoint={true} showLabels={showLabels} />)}
+            <GamutVolume points={gamutPoints} mode="3d" colorL={gamutColorL} autoL={gamutAutoL} opacity={gamutOpacity} />
+        </>
+    );
+};
+
+const Scene2D = ({ basePoints, historyPoints, testPoints, captureRef, showLabels, gamutColorL, gamutAutoL, gamutOpacity }) => {
+    const gamutPoints = useMemo(() => [...basePoints.filter(p=>p.visible!==false), ...historyPoints.filter(p=>p.visible!==false)], [basePoints, historyPoints]);
+    const renderBase = useMemo(() => basePoints.filter(p => p.showPoint !== false), [basePoints]);
+    const renderHistory = useMemo(() => historyPoints.filter(p => p.showPoint !== false), [historyPoints]);
+    const renderTest = useMemo(() => testPoints.filter(p => p.showPoint !== false), [testPoints]);
+    return (
+        <>
+            <ScreenshotHandler captureRef={captureRef} />
+            <ambientLight intensity={1.5} />
+            <directionalLight position={[0, 0, 100]} intensity={1} />
+            <MapControls makeDefault screenSpacePanning={true} minZoom={0.5} maxZoom={5} dampingFactor={0.1} />
+            <AxesSystem2D />
+            {renderBase.map((p) => <LabPoint key={p.id} {...p} mode="2d" showLabels={showLabels} typeLabel="Base" />)}
+            {renderHistory.map((p) => <LabPoint key={p.id} {...p} mode="2d" showLabels={showLabels} typeLabel="Hist" />)}
+            {renderTest.map((p) => <LabPoint key={p.id} {...p} mode="2d" isTestPoint={true} showLabels={showLabels} />)}
+            <GamutVolume points={gamutPoints} mode="2d" colorL={gamutColorL} autoL={gamutAutoL} opacity={gamutOpacity} />
+        </>
+    );
+};
+
+const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorClass = 'text-blue-700', deltaE, isStandard, onToggleStandard }) => {
+    const colorPreview = ColorUtils.labToHex(point.l, point.a, point.b);
+    const handleChange = (field, value) => {
+        if (field === 'name' || field === 'visible' || field === 'showPoint') { onChange(point.id, field, value); return; }
+        let val = parseFloat(value); if(isNaN(val)) val = 0;
+        if (field === 'l') val = ColorUtils.clamp(val, 0, 200); if (field === 'a' || field === 'b') val = ColorUtils.clamp(val, -200, 200);
+        onChange(point.id, field, val);
+    };
+
+    // Local text drafts for l/a/b so the user can type a leading "-" (or a trailing ".")
+    // without it being immediately parsed back to 0. Only committed to parent state once
+    // the draft is a complete, valid number.
+    const [drafts, setDrafts] = useState({ l: String(point.l), a: String(point.a), b: String(point.b) });
+    const focusedFieldRef = useRef(null);
+    const NUMERIC_DRAFT_RE = /^-?\d*\.?\d*$/;
+
+    useEffect(() => {
+        setDrafts(prev => ({
+            l: focusedFieldRef.current === 'l' ? prev.l : String(point.l),
+            a: focusedFieldRef.current === 'a' ? prev.a : String(point.a),
+            b: focusedFieldRef.current === 'b' ? prev.b : String(point.b),
+        }));
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [point.l, point.a, point.b]);
+
+    const handleNumericDraftChange = (field, rawValue) => {
+        // Allow intermediate typing states: "", "-", "-.", "3.", "-3." etc. without committing yet.
+        if (rawValue === '' || rawValue === '-' || NUMERIC_DRAFT_RE.test(rawValue)) {
+            setDrafts(prev => ({ ...prev, [field]: rawValue }));
+            // Only push to parent state once it's a complete number (not mid-typing like "-" or "3.")
+            if (rawValue !== '' && rawValue !== '-' && !rawValue.endsWith('.') && !isNaN(parseFloat(rawValue))) {
+                handleChange(field, rawValue);
+            }
+            return;
+        }
+        // Reject any character that doesn't fit a plain signed decimal number.
+    };
+
+    const handleNumericFocus = (field) => { focusedFieldRef.current = field; };
+    const handleNumericBlur = (field) => {
+        focusedFieldRef.current = null;
+        // Finalize: if what's left isn't a full valid number, snap back to the committed point value.
+        const raw = drafts[field];
+        if (raw === '' || raw === '-' || raw.endsWith('.') || isNaN(parseFloat(raw))) {
+            setDrafts(prev => ({ ...prev, [field]: String(point[field]) }));
+        } else {
+            handleChange(field, raw);
+            setDrafts(prev => ({ ...prev, [field]: String(ColorUtils.clamp(parseFloat(raw), field === 'l' ? 0 : -200, field === 'l' ? 200 : 200)) }));
+        }
+    };
+
+    return (
+        <div className={`flex flex-col mb-2 bg-white p-2 rounded-lg shadow-sm border group transition-colors ${isStandard ? 'border-yellow-400 bg-yellow-50' : 'border-gray-100 hover:border-blue-300'}`}>
+            <div className="mb-2 flex items-center border-b border-gray-100 pb-1">
+                <div className="mr-2 flex items-center gap-1 border-r border-gray-100 pr-2">
+                    {isTestPoint ? (
+                        <>
+                            <button onClick={() => onToggleStandard(point.id)} className={`w-9 h-9 md:w-6 md:h-6 flex items-center justify-center rounded transition-colors ${isStandard ? 'text-red-500 hover:text-red-600 bg-red-50' : 'text-gray-300 hover:text-red-400'}`} title={isStandard ? "Unset Standard" : "Set as Standard"}><Target size={16} fill={isStandard ? "currentColor" : "none"} /></button>
+                            <button onClick={() => handleChange('showPoint', !(point.showPoint !== false))} className={`w-9 h-9 md:w-6 md:h-6 flex items-center justify-center rounded transition-colors ${point.showPoint !== false ? 'text-gray-600 hover:text-gray-800' : 'text-gray-300 hover:text-gray-400'}`} title="Show/Hide"><Eye size={16} /></button>
+                        </>
+                    ) : (
+                        <>
+                            <button 
+                                onClick={() => handleChange('visible', !(point.visible !== false))}
+                                className="w-9 h-9 md:w-6 md:h-6 flex items-center justify-center text-gray-400 hover:text-blue-600 transition-colors"
+                                title="Toggle Gamut Visibility"
+                            >
+                                {point.visible !== false ? (
+                                    <div className="w-4 h-4 bg-blue-100 text-blue-600 rounded flex items-center justify-center">
+                                        <CheckSquareIcon size={14} />
+                                    </div>
+                                ) : (
+                                    <div className="w-4 h-4 border border-gray-300 rounded hover:border-blue-400"></div>
+                                )}
+                            </button>
+                            <button onClick={() => handleChange('showPoint', !(point.showPoint !== false))} className={`w-9 h-9 md:w-6 md:h-6 flex items-center justify-center rounded transition-colors ${point.showPoint !== false ? 'text-gray-600 hover:text-gray-800' : 'text-gray-300 hover:text-gray-400'}`}><Eye size={16} /></button>
+                        </>
+                    )}
+                </div>
+                <span className="text-[10px] text-gray-400 font-bold mr-1">Name:</span>
+                <input type="text" placeholder="Name" value={point.name || ''} onChange={(e) => handleChange('name', e.target.value)} className={`flex-1 min-w-0 md:flex-none md:w-16 text-sm md:text-xs font-medium focus:outline-none placeholder-gray-300 bg-transparent ${inputColorClass}`} />
+                {isTestPoint && !isStandard && deltaE && <div className="ml-auto bg-gray-100 px-1.5 py-0.5 rounded text-[10px] font-mono text-gray-600 flex items-center"><span className="font-bold text-gray-400 mr-1">ΔE</span><span className={parseFloat(deltaE) > 5 ? "text-red-500 font-bold" : "text-gray-800"}>{deltaE}</span></div>}
+                {isStandard && <div className="ml-auto bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded text-[10px] font-bold">STD</div>}
+            </div>
+            <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-md border border-gray-200 shadow-inner flex-shrink-0" style={{ backgroundColor: colorPreview }} title={`Preview: ${colorPreview}`} />
+                <div className="grid grid-cols-3 gap-2 flex-grow">
+                    {['l', 'a', 'b'].map(field => (
+                        <div key={field} className="flex flex-col relative">
+                            <label className="absolute -top-2 md:-top-1.5 left-1 text-[10px] md:text-[8px] bg-white px-0.5 text-gray-400 font-bold uppercase tracking-wider pointer-events-none">{field}</label>
+                            <input
+                                type="text"
+                                inputMode="decimal"
+                                value={drafts[field]}
+                                onChange={(e) => handleNumericDraftChange(field, e.target.value)}
+                                onFocus={() => handleNumericFocus(field)}
+                                onBlur={() => handleNumericBlur(field)}
+                                className={`w-full text-center text-base md:text-sm border border-gray-200 rounded py-2 md:py-1 px-0.5 focus:border-blue-500 focus:outline-none transition-all focus:bg-white ${point.visible === false ? 'bg-gray-50 text-gray-500' : 'bg-gray-50'}`}
+                            />
+                        </div>
+                    ))}
+                </div>
+                <button onClick={() => onDelete(point.id)} className="text-gray-300 hover:text-red-500 hover:bg-red-50 p-2.5 md:p-1.5 rounded-full transition-all"><Trash2 size={14} /></button>
+            </div>
+            {/* Gamut Distance Info for Test Points */}
+            {isTestPoint && point.gamutDeltas && (
+                <div className={`mt-2 rounded px-2 py-1.5 text-[10px] font-mono border flex items-center gap-2 ${point.gamutDeltas.isInside ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : 'bg-slate-50 text-slate-600 border-slate-100'}`}>
+                    {point.gamutDeltas.isInside ? (
+                        <span className="font-bold flex items-center gap-1"><div className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></div> In Gamut</span>
+                    ) : (
+                        <div className="flex flex-col w-full">
+                            <div className="flex items-center justify-between mb-0.5">
+                                <span className="font-bold text-slate-400 flex items-center gap-1"><CornerRightDown size={10}/> Correction (L-Priority)</span>
+                            </div>
+                            <div className="flex justify-between items-center text-slate-700 font-bold">
+                                <span>DL: <span className={Math.abs(point.gamutDeltas.dl) > 0 ? "text-blue-600" : ""}>{point.gamutDeltas.dl > 0 ? '+' : ''}{point.gamutDeltas.dl}</span></span>
+                                <span>DA: <span className={Math.abs(point.gamutDeltas.da) > 0 ? "text-blue-600" : ""}>{point.gamutDeltas.da > 0 ? '+' : ''}{point.gamutDeltas.da}</span></span>
+                                <span>DB: <span className={Math.abs(point.gamutDeltas.db) > 0 ? "text-blue-600" : ""}>{point.gamutDeltas.db > 0 ? '+' : ''}{point.gamutDeltas.db}</span></span>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const CheckSquare = ({size}) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 11 12 14 22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg>
+);
+
+// 手機（<768px）使用底部分頁切換「資料 / 視圖」；平板與桌機維持左右並排
+const useIsDesktop = () => {
+    const query = '(min-width: 768px)';
+    const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+    useEffect(() => {
+        const mql = window.matchMedia(query);
+        const onChange = (e) => setMatches(e.matches);
+        mql.addEventListener('change', onChange);
+        return () => mql.removeEventListener('change', onChange);
+    }, []);
+    return matches;
+};
+
+function App() {
+    const getInitialData = (key, fallback) => { try { const item = window.localStorage.getItem(key); return item ? JSON.parse(item) : fallback; } catch (error) { return fallback; } };
+    const [basePoints, setBasePoints] = useState(() => getInitialData('lab_basePoints', [{ id: 1, l: 80, a: 0, b: 0, name: '', visible: true, showPoint: true }, { id: 2, l: 20, a: 0, b: 0, name: '', visible: true, showPoint: true }, { id: 3, l: 50, a: 80, b: 60, name: '', visible: true, showPoint: true }, { id: 4, l: 50, a: -60, b: -40, name: '', visible: true, showPoint: true }]));
+    const [historyPoints, setHistoryPoints] = useState(() => getInitialData('lab_historyPoints', [{ id: 501, l: 60, a: 40, b: -20, name: 'Old Mix', visible: true, showPoint: true }]));
+    const [testPoints, setTestPoints] = useState(() => getInitialData('lab_testPoints', [{ id: 101, l: 55, a: 10, b: 10, name: 'Sample A', showPoint: true, isStandard: false }, { id: 102, l: 50, a: 15, b: 5, name: 'Sample B', showPoint: true, isStandard: false }]));
+    const [showLabels, setShowLabels] = useState(false);
+    const [viewMode, setViewMode] = useState('split');
+    const [showCamera, setShowCamera] = useState(false);
+    const [mobileTab, setMobileTab] = useState('data');
+    const isDesktop = useIsDesktop();
+    // 隱藏中的 3D/2D 畫布暫停繪製以節省手機電量
+    const viewActive = isDesktop || mobileTab === 'view';
+    const fileInputRef = useRef(null);
+
+    // Gamut surface display settings (color L override + opacity), user-adjustable via drag sliders
+    const [gamutAutoL, setGamutAutoL] = useState(true);
+    const [gamutColorL, setGamutColorL] = useState(() => getInitialData('lab_gamutColorL', 50));
+    const [gamutOpacity, setGamutOpacity] = useState(() => getInitialData('lab_gamutOpacity', 0.6));
+    const [showGamutPanel, setShowGamutPanel] = useState(false);
+    useEffect(() => { window.localStorage.setItem('lab_gamutColorL', JSON.stringify(gamutColorL)); window.localStorage.setItem('lab_gamutOpacity', JSON.stringify(gamutOpacity)); }, [gamutColorL, gamutOpacity]);
+    
+    // Gamut Calculation Mesh (Memoized)
+    const gamutMesh = useMemo(() => {
+        const gamutPoints = [...basePoints.filter(p=>p.visible!==false), ...historyPoints.filter(p=>p.visible!==false)];
+        if (gamutPoints.length < 4) return null;
+
+        const vectors = gamutPoints.map(p => new THREE.Vector3(p.a, p.l, p.b)); // X=a, Y=l, Z=b
+        
+        try {
+            const geo = new ConvexGeometry(vectors);
+            // Critical Fix: Use DoubleSide to ensure Raycaster hits both entry (Top) and exit (Bottom) faces
+            const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }));
+            return mesh;
+        } catch (e) {
+            console.warn("Failed to generate hull for calc", e);
+            return null;
+        }
+    }, [basePoints, historyPoints]);
+
+    useEffect(() => { window.localStorage.setItem('lab_basePoints', JSON.stringify(basePoints)); window.localStorage.setItem('lab_historyPoints', JSON.stringify(historyPoints)); window.localStorage.setItem('lab_testPoints', JSON.stringify(testPoints)); }, [basePoints, historyPoints, testPoints]);
+    
+    const capture3DRef = useRef(null); const capture2DRef = useRef(null);
+    const addPoint = (type) => { const newPoint = { id: Date.now(), l: 50, a: 0, b: 0, name: '', visible: true, showPoint: true, isStandard: false }; if (type === 'base') setBasePoints([...basePoints, newPoint]); else if (type === 'history') setHistoryPoints([...historyPoints, newPoint]); else setTestPoints([...testPoints, newPoint]); };
+    const addFromCamera = (labData) => { const newPoint = { id: Date.now(), l: labData.l, a: labData.a, b: labData.b, name: 'Cam Capture', visible: true, showPoint: true, isStandard: false }; setTestPoints([...testPoints, newPoint]); };
+    const updatePoint = (listType, id, field, value) => { let setter = listType === 'base' ? setBasePoints : (listType === 'history' ? setHistoryPoints : setTestPoints); setter(prev => prev.map(p => p.id === id ? { ...p, [field]: value } : p)); };
+    const toggleStandard = (id) => { setTestPoints(prev => prev.map(p => ({ ...p, isStandard: p.id === id ? !p.isStandard : false }))); };
+    const deletePoint = (listType, id) => { let setter = listType === 'base' ? setBasePoints : (listType === 'history' ? setHistoryPoints : setTestPoints); setter(prev => prev.filter(p => p.id !== id)); };
+    const reset = () => { if(confirm('Are you sure you want to reset all data?')) { setBasePoints([{ id: 1, l: 80, a: 0, b: 0, name: '', visible: true, showPoint: true }, { id: 2, l: 20, a: 0, b: 0, name: '', visible: true, showPoint: true }, { id: 3, l: 50, a: 80, b: 60, name: '', visible: true, showPoint: true }, { id: 4, l: 50, a: -60, b: -40, name: '', visible: true, showPoint: true }]); setHistoryPoints([]); setTestPoints([]); } };
+    const standardPoint = testPoints.find(p => p.isStandard);
+    
+    // Toggle All Helpers
+    const toggleAll = (type, field) => {
+        let setter = type === 'base' ? setBasePoints : (type === 'history' ? setHistoryPoints : setTestPoints);
+        setter(prev => {
+            const allTrue = prev.every(p => p[field] !== false); // Note: explicit check against false because undefined/true is visible
+            const target = !allTrue;
+            return prev.map(p => ({ ...p, [field]: target }));
+        });
+    };
+
+    const isAllChecked = (points, field) => points.length > 0 && points.every(p => p[field] !== false);
+
+    // Excel Import Handler
+    const handleExcelImport = (e) => {
+        const file = e.target.files[0];
+        if(!file) return;
+
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+            try {
+                const data = new Uint8Array(evt.target.result);
+                const workbook = XLSX.read(data, { type: 'array' });
+                
+                let newBase = [];
+                let newHistory = [];
+                let newTest = [];
+
+                workbook.SheetNames.forEach(sheetName => {
+                    const lowerName = sheetName.toLowerCase();
+                    const sheet = workbook.Sheets[sheetName];
+                    const json = XLSX.utils.sheet_to_json(sheet);
+                    
+                    // Helper to parse row
+                    const parseRow = (row) => {
+                        // Try to find keys case-insensitively
+                        const keys = Object.keys(row);
+                        const getVal = (k) => {
+                            const key = keys.find(key => key.toLowerCase() === k.toLowerCase());
+                            return key ? parseFloat(row[key]) : null;
+                        };
+                        const getName = () => {
+                            const key = keys.find(key => key.toLowerCase() === 'name');
+                            return key ? row[key] : '';
+                        }
+
+                        // Look for 'L', 'a', 'b' specifically
+                        const l = getVal('l');
+                        const a = getVal('a');
+                        const b = getVal('b');
+                        
+                        if (l !== null && a !== null && b !== null && !isNaN(l) && !isNaN(a) && !isNaN(b)) {
+                            return {
+                                id: Date.now() + Math.random(),
+                                l: ColorUtils.clamp(l, 0, 200),
+                                a: ColorUtils.clamp(a, -200, 200),
+                                b: ColorUtils.clamp(b, -200, 200),
+                                name: getName(),
+                                visible: true,
+                                showPoint: true,
+                                isStandard: false
+                            };
+                        }
+                        return null;
+                    };
+
+                    const parsedPoints = json.map(parseRow).filter(p => p !== null);
+
+                    if (lowerName.includes('base')) {
+                        newBase = [...newBase, ...parsedPoints];
+                    } else if (lowerName.includes('history')) {
+                        newHistory = [...newHistory, ...parsedPoints];
+                    } else if (lowerName.includes('test')) {
+                        newTest = [...newTest, ...parsedPoints];
+                    }
+                });
+
+                if (newBase.length > 0) setBasePoints(prev => [...prev, ...newBase]);
+                if (newHistory.length > 0) setHistoryPoints(prev => [...prev, ...newHistory]);
+                if (newTest.length > 0) setTestPoints(prev => [...prev, ...newTest]);
+
+                alert(`Imported: ${newBase.length} Base, ${newHistory.length} History, ${newTest.length} Test points.`);
+            } catch (err) {
+                console.error(err);
+                // Updated error message to reflect expected format
+                alert("Failed to parse Excel file. Please check format: Name, L, a, b");
+            }
+            // Reset input
+            if (fileInputRef.current) fileInputRef.current.value = '';
+        };
+        reader.readAsArrayBuffer(file);
+    };
+
+    const triggerExcelInput = () => fileInputRef.current && fileInputRef.current.click();
+
+    // Excel Export Handler
+    const handleExcelExport = () => {
+        const wb = XLSX.utils.book_new();
+
+        const formatData = (points) => points.map(p => ({
+            Name: p.name,
+            L: p.l,
+            a: p.a,
+            b: p.b,
+            Visible: p.visible ? 'Yes' : 'No',
+            ShowPoint: p.showPoint ? 'Yes' : 'No',
+            ...(p.isStandard !== undefined ? { IsStandard: p.isStandard ? 'Yes' : 'No' } : {})
+        }));
+
+        if (basePoints.length > 0) {
+            const wsBase = XLSX.utils.json_to_sheet(formatData(basePoints));
+            XLSX.utils.book_append_sheet(wb, wsBase, "Base Points");
+        }
+        if (historyPoints.length > 0) {
+            const wsHist = XLSX.utils.json_to_sheet(formatData(historyPoints));
+            XLSX.utils.book_append_sheet(wb, wsHist, "History Points");
+        }
+        if (testPoints.length > 0) {
+            const wsTest = XLSX.utils.json_to_sheet(formatData(testPoints));
+            XLSX.utils.book_append_sheet(wb, wsTest, "Test Points");
+        }
+
+        const base64 = XLSX.write(wb, { bookType: 'xlsx', type: 'base64' });
+        saveFile("lab_gamut_data.xlsx", base64, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            .catch(err => { console.warn('Excel export failed', err); alert('Export failed. Please try again.'); });
+    };
+
+    // Process test points to add DeltaE and Gamut Delta info
+    const processedTestPoints = testPoints.map(p => { 
+        let processed = { ...p };
+        // Delta E
+        if (standardPoint && p.id !== standardPoint.id) { 
+            processed.deltaE = ColorUtils.calculateDeltaE(standardPoint, p); 
+        }
+        // Gamut Delta
+        if (gamutMesh) {
+            processed.gamutDeltas = GamutUtils.calculateClosestDeltas(p, gamutMesh);
+        }
+        return processed; 
+    });
+
+    return (
+        <div className="fixed inset-0 flex flex-col md:flex-row w-full h-full bg-[#1e1e24] md:bg-slate-50 font-sans text-gray-800 overflow-hidden" style={{ paddingTop: 'env(safe-area-inset-top)', paddingLeft: 'env(safe-area-inset-left)', paddingRight: 'env(safe-area-inset-right)' }}>
+            {showCamera && <CameraPicker onCapture={addFromCamera} onClose={() => setShowCamera(false)} />}
+            <input type="file" ref={fileInputRef} onChange={handleExcelImport} accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" className="hidden" />
+            <nav className="order-last md:hidden shrink-0 flex bg-[#1e1e24] border-t border-white/10" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
+                {[['data', 'Points', List], ['view', 'Viewer', Box]].map(([key, label, Icon]) => (
+                    <button key={key} onClick={() => setMobileTab(key)} aria-current={mobileTab === key ? 'page' : undefined} className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-2 text-[11px] font-bold transition-colors active:bg-white/5 ${mobileTab === key ? 'text-blue-400' : 'text-gray-500'}`}>
+                        <Icon size={22} />{label}
+                    </button>
+                ))}
+            </nav>
+            
+            <div className={`${mobileTab === 'data' ? 'flex' : 'hidden'} md:flex w-full md:w-1/2 flex-col bg-white border-r border-gray-200 flex-1 min-h-0 md:flex-none md:h-full z-10 shadow-xl overflow-hidden`}>
+                <div className="p-4 border-b border-gray-100 bg-gradient-to-r from-blue-50 to-white flex justify-between items-center flex-shrink-0">
+                    <div className="flex items-center gap-2"><div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold shadow-blue-200 shadow-lg">Lab</div><h1 className="text-lg font-bold text-gray-800">Gamut Simulator</h1></div>
+                    <div className="flex gap-2">
+                        <button onClick={triggerExcelInput} className="p-2.5 md:p-2 text-gray-400 hover:text-green-600 hover:bg-green-50 rounded-full transition-all" title="Import Excel"><FileSpreadsheet size={18} /></button>
+                        <button onClick={handleExcelExport} className="p-2.5 md:p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-all" title="Export Excel"><Download size={18} /></button>
+                        <button onClick={reset} className="p-2.5 md:p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-all" title="Reset"><RotateCcw size={18} /></button>
+                    </div>
+                </div>
+                <div className="flex-1 overflow-y-auto p-3 md:p-4 space-y-4 md:space-y-6 custom-scrollbar min-w-0 overscroll-contain">
+                    <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 flex flex-col md:max-h-[320px]">
+                        <div className="flex justify-between items-center mb-3 flex-shrink-0">
+                            <div className="flex items-center gap-2">
+                                <h2 className="text-sm font-bold flex items-center gap-2 text-slate-700"><div className="w-2.5 h-2.5 rounded-full bg-blue-500 shadow-sm"></div> Base Points</h2>
+                                <div className="flex items-center gap-1 ml-2 border-l border-slate-200 pl-2">
+                                    <button onClick={() => toggleAll('base', 'visible')} className={`w-8 h-8 md:w-5 md:h-5 flex items-center justify-center rounded hover:bg-blue-100 transition-colors ${isAllChecked(basePoints, 'visible') ? 'text-blue-600' : 'text-gray-400'}`} title="Select/Deselect All Gamut">{isAllChecked(basePoints, 'visible') ? <CheckSquareIcon size={14} /> : <Square size={14} />}</button>
+                                    <button onClick={() => toggleAll('base', 'showPoint')} className={`w-8 h-8 md:w-5 md:h-5 flex items-center justify-center rounded hover:bg-blue-100 transition-colors ${isAllChecked(basePoints, 'showPoint') ? 'text-gray-600' : 'text-gray-400'}`} title="Show/Hide All Points"><Eye size={14} /></button>
+                                </div>
+                            </div>
+                            <button onClick={() => addPoint('base')} className="flex items-center gap-1 text-xs bg-white border border-blue-200 hover:border-blue-400 text-blue-600 px-3.5 py-2.5 md:px-3 md:py-1.5 rounded-full shadow-sm transition-all active:scale-95"><Plus size={14} /> <span className="font-medium">Add</span></button>
+                        </div>
+                        <div className="space-y-1 md:overflow-y-auto md:pr-2 custom-scrollbar flex-1">{basePoints.map(p => <InputRow key={p.id} point={p} onChange={(id, f, v) => updatePoint('base', id, f, v)} onDelete={(id) => deletePoint('base', id)} />)}</div>
+                    </div>
+                    
+                    <div className="bg-orange-50 p-3 rounded-xl border border-orange-100 flex flex-col md:max-h-[320px]">
+                        <div className="flex justify-between items-center mb-3 flex-shrink-0">
+                            <div className="flex items-center gap-2">
+                                <h2 className="text-sm font-bold flex items-center gap-2 text-orange-900"><div className="w-2.5 h-2.5 rounded-full bg-orange-500 shadow-sm"></div> History Points</h2>
+                                <div className="flex items-center gap-1 ml-2 border-l border-orange-200 pl-2">
+                                    <button onClick={() => toggleAll('history', 'visible')} className={`w-8 h-8 md:w-5 md:h-5 flex items-center justify-center rounded hover:bg-orange-200 transition-colors ${isAllChecked(historyPoints, 'visible') ? 'text-blue-600' : 'text-gray-400'}`} title="Select/Deselect All Gamut">{isAllChecked(historyPoints, 'visible') ? <CheckSquareIcon size={14} /> : <Square size={14} />}</button>
+                                    <button onClick={() => toggleAll('history', 'showPoint')} className={`w-8 h-8 md:w-5 md:h-5 flex items-center justify-center rounded hover:bg-orange-200 transition-colors ${isAllChecked(historyPoints, 'showPoint') ? 'text-gray-600' : 'text-gray-400'}`} title="Show/Hide All Points"><Eye size={14} /></button>
+                                </div>
+                            </div>
+                            <button onClick={() => addPoint('history')} className="flex items-center gap-1 text-xs bg-white border border-orange-200 hover:border-orange-400 text-orange-600 px-3.5 py-2.5 md:px-3 md:py-1.5 rounded-full shadow-sm transition-all active:scale-95"><Plus size={14} /> <span className="font-medium">Add</span></button>
+                        </div>
+                        <div className="space-y-1 md:overflow-y-auto md:pr-2 custom-scrollbar flex-1">{historyPoints.map(p => <InputRow key={p.id} point={p} inputColorClass="text-orange-700" onChange={(id, f, v) => updatePoint('history', id, f, v)} onDelete={(id) => deletePoint('history', id)} />)}</div>
+                    </div>
+                    
+                    <div className="bg-purple-50 p-3 rounded-xl border border-purple-100 flex flex-col md:max-h-[40vh]">
+                        <div className="flex justify-between items-center mb-3 flex-shrink-0">
+                            <div className="flex items-center gap-2">
+                                <h2 className="text-sm font-bold flex items-center gap-2 text-purple-900"><div className="w-2.5 h-2.5 rounded-sm bg-purple-600 shadow-sm"></div> Test Points</h2>
+                                <div className="flex items-center gap-1 ml-2 border-l border-purple-200 pl-2">
+                                    <button onClick={() => toggleAll('test', 'showPoint')} className={`w-8 h-8 md:w-5 md:h-5 flex items-center justify-center rounded hover:bg-purple-200 transition-colors ${isAllChecked(testPoints, 'showPoint') ? 'text-gray-600' : 'text-gray-400'}`} title="Show/Hide All Points"><Eye size={14} /></button>
+                                </div>
+                            </div>
+                            <div className="flex gap-2">
+                                <button onClick={() => setShowCamera(true)} className="flex items-center gap-1 text-xs bg-white border border-purple-200 hover:border-purple-400 text-purple-600 px-3.5 py-2.5 md:px-3 md:py-1.5 rounded-full shadow-sm transition-all active:scale-95" title="Camera Picker"><Camera size={14} /></button>
+                                <button onClick={() => addPoint('test')} className="flex items-center gap-1 text-xs bg-white border border-purple-200 hover:border-purple-400 text-purple-600 px-3.5 py-2.5 md:px-3 md:py-1.5 rounded-full shadow-sm transition-all active:scale-95"><Plus size={14} /> <span className="font-medium">Add</span></button>
+                            </div>
+                        </div>
+                        <div className="space-y-1 md:overflow-y-auto md:pr-2 custom-scrollbar flex-1">{processedTestPoints.map(p => <InputRow key={p.id} point={p} isTestPoint={true} inputColorClass="text-purple-700" isStandard={p.isStandard} deltaE={p.deltaE} onChange={(id, f, v) => updatePoint('test', id, f, v)} onDelete={(id) => deletePoint('test', id)} onToggleStandard={toggleStandard} />)}</div>
+                    </div>
+                </div>
+            </div>
+            <div className={`${mobileTab === 'view' ? 'flex' : 'hidden'} md:flex flex-1 relative min-h-0 md:h-full flex-col bg-[#1e1e24] overflow-hidden min-w-0`}>
+                <div className="relative flex items-center justify-center p-2 bg-[#1e1e24] border-b border-white/10 shrink-0 z-30">
+                    <div className="flex bg-black/40 rounded-lg p-1 border border-white/10">
+                        <button onClick={() => setViewMode('3d')} className={`px-4 py-2 md:py-1.5 text-xs font-bold rounded-md transition-all ${viewMode === '3d' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}>3D</button>
+                        <button onClick={() => setViewMode('2d')} className={`px-4 py-2 md:py-1.5 text-xs font-bold rounded-md transition-all ${viewMode === '2d' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}>2D</button>
+                        <button onClick={() => setViewMode('split')} className={`px-4 py-2 md:py-1.5 text-xs font-bold rounded-md transition-all ${viewMode === 'split' ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}>Split</button>
+                    </div>
+                    <button
+                        onClick={() => setShowGamutPanel(!showGamutPanel)}
+                        className={`absolute right-3 top-1/2 -translate-y-1/2 p-2.5 md:p-2 rounded-lg border transition-all active:scale-95 ${showGamutPanel ? 'bg-blue-600 text-white border-blue-500' : 'bg-black/40 text-white/70 border-white/10 hover:bg-white/10'}`}
+                        title="Gamut Color / Opacity"
+                    >
+                        <SlidersHorizontal size={16} />
+                    </button>
+                    <GamutDisplayPanel
+                        open={showGamutPanel}
+                        onClose={() => setShowGamutPanel(false)}
+                        autoL={gamutAutoL}
+                        setAutoL={setGamutAutoL}
+                        colorL={gamutColorL}
+                        setColorL={setGamutColorL}
+                        opacity={gamutOpacity}
+                        setOpacity={setGamutOpacity}
+                    />
+                </div>
+                <div className="flex-1 relative flex flex-col">
+                    {(viewMode === '3d' || viewMode === 'split') && <div className={`relative ${viewMode === 'split' ? 'h-1/2 border-b border-white/10' : 'h-full'}`}><ViewContainer title="3D View" onCapture={() => capture3DRef.current && capture3DRef.current()} onToggleLabels={() => setShowLabels(!showLabels)} showLabels={showLabels}><Canvas frameloop={viewActive ? 'always' : 'never'} camera={{ position: [200, 150, 200], fov: 40 }} dpr={[1, 2]}><color attach="background" args={['#1e1e24']} /><Scene3D basePoints={basePoints} historyPoints={historyPoints} testPoints={processedTestPoints} captureRef={capture3DRef} showLabels={showLabels} gamutColorL={gamutColorL} gamutAutoL={gamutAutoL} gamutOpacity={gamutOpacity} /></Canvas></ViewContainer></div>}
+                    {(viewMode === '2d' || viewMode === 'split') && <div className={`relative ${viewMode === 'split' ? 'h-1/2' : 'h-full'}`}><ViewContainer title="2D View (a-b)" onCapture={() => capture2DRef.current && capture2DRef.current()} onToggleLabels={() => setShowLabels(!showLabels)} showLabels={showLabels}><Canvas frameloop={viewActive ? 'always' : 'never'} orthographic camera={{ position: [0, 0, 100], zoom: 1.5, near: 0.1, far: 1000 }} dpr={[1, 2]}><color attach="background" args={['#18181b']} /><Scene2D basePoints={basePoints} historyPoints={historyPoints} testPoints={processedTestPoints} captureRef={capture2DRef} showLabels={showLabels} gamutColorL={gamutColorL} gamutAutoL={gamutAutoL} gamutOpacity={gamutOpacity} /></Canvas></ViewContainer></div>}
+                </div>
+            </div>
+        </div>
+    );
+}
+const root = createRoot(document.getElementById('root')); root.render(<App />);
