@@ -28,6 +28,15 @@ APK 由 GitHub Actions 自動建置：每次推送到 `main`，或在 **Actions 
 
 每個點（Base / History / Test）除了 Name、L、a、b 之外，都可以記錄 **Material（材質）**，輸入時會列出先前輸入過的材質供快速選擇。Excel 匯出會多一欄 `Material`；匯入時讀取 `Material`（或中文欄名「材質」），沒有這一欄也可以正常匯入。
 
+## 匯出／匯入
+
+標題列有四個按鈕：
+
+- **Export Excel**：匯出 `lab_gamut_data.xlsx`，每個工作表（Base / History / Test Points）只含 `Name、Material、L、a、b`，格式與 Excel 匯入相同，可直接再匯入。
+- **Export 全部資料與設定（.json）**：匯出 `lab_gamut_backup_時間.json`，包含 Base / History / Test 全部資料點（含材質、顯示與標準點狀態）與設定（色域顏色 L、透明度、標籤顯示、視圖模式、相機取樣範圍）。
+- **Import 備份（.json）**：讀回上述 JSON，會取代目前所有資料與設定（匯入前會確認）。
+- **Import Excel**：維持原本行為，把資料點加到現有清單。
+
 ## 本機開發
 
 需要 Node.js 22 以上。

@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import * as XLSX from '@e965/xlsx';
 import './index.css';
 import { ConvexGeometry } from 'three/examples/jsm/geometries/ConvexGeometry';
-import { Plus, Trash2, RotateCcw, Info, Box, Camera, Maximize, Minimize, Tag, Eye, EyeOff, LayoutTemplate, Square, Circle, Target, X, Aperture, Upload, Image as ImageIcon, CornerRightDown, FileSpreadsheet, Download, CheckSquare as CheckSquareIcon, SlidersHorizontal, Sun, Droplet, List } from 'lucide-react';
+import { Plus, Trash2, RotateCcw, Info, Box, Camera, Maximize, Minimize, Tag, Eye, EyeOff, LayoutTemplate, Square, Circle, Target, X, Aperture, Upload, Image as ImageIcon, CornerRightDown, FileSpreadsheet, Download, CheckSquare as CheckSquareIcon, SlidersHorizontal, Sun, Droplet, List, FileDown, FileUp } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
@@ -1196,15 +1196,13 @@ function App() {
     const handleExcelExport = () => {
         const wb = XLSX.utils.book_new();
 
+        // 只輸出名稱、材質與 Lab 值（欄位與匯入格式相同，可直接再匯入）
         const formatData = (points) => points.map(p => ({
             Name: p.name,
             Material: p.material || '',
             L: p.l,
             a: p.a,
-            b: p.b,
-            Visible: p.visible ? 'Yes' : 'No',
-            ShowPoint: p.showPoint ? 'Yes' : 'No',
-            ...(p.isStandard !== undefined ? { IsStandard: p.isStandard ? 'Yes' : 'No' } : {})
+            b: p.b
         }));
 
         if (basePoints.length > 0) {
@@ -1225,6 +1223,57 @@ function App() {
             .catch(err => { console.warn('Excel export failed', err); alert('Export failed. Please try again.'); });
     };
 
+    // JSON 完整備份：所有資料點 + 設定
+    const jsonInputRef = useRef(null);
+    const handleJsonExport = () => {
+        let camRoiPct = null;
+        try { const v = parseFloat(localStorage.getItem('lab_camRoiPct')); if (v >= 3 && v <= 40) camRoiPct = v; } catch (e) {}
+        const payload = {
+            app: 'lab-gamut-simulator',
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            points: { base: basePoints, history: historyPoints, test: testPoints },
+            settings: { gamutAutoL, gamutColorL, gamutOpacity, showLabels, viewMode, camRoiPct }
+        };
+        const bytes = new TextEncoder().encode(JSON.stringify(payload, null, 2));
+        let bin = ''; bytes.forEach(c => { bin += String.fromCharCode(c); });
+        const stamp = new Date().toISOString().slice(0, 19).split('-').join('').split(':').join('').split('T').join('');
+        saveFile(`lab_gamut_backup_${stamp}.json`, btoa(bin), 'application/json')
+            .catch(err => { console.warn('JSON export failed', err); alert('Export failed. Please try again.'); });
+    };
+    const handleJsonImport = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+            try {
+                const data = JSON.parse(evt.target.result);
+                const pts = data && data.points;
+                if (!pts || !Array.isArray(pts.base) || !Array.isArray(pts.history) || !Array.isArray(pts.test)) throw new Error('bad format');
+                const clean = (list) => list.filter(p => p && isFinite(p.l) && isFinite(p.a) && isFinite(p.b)).map((p, i) => ({
+                    ...p, id: p.id != null ? p.id : Date.now() + i, l: Number(p.l), a: Number(p.a), b: Number(p.b),
+                    name: p.name != null ? String(p.name) : '', material: p.material != null ? String(p.material) : ''
+                }));
+                if (!confirm('Importing will REPLACE all current points and settings. Continue?')) return;
+                const nb = clean(pts.base), nh = clean(pts.history), nt = clean(pts.test);
+                setBasePoints(nb); setHistoryPoints(nh); setTestPoints(nt);
+                const st = data.settings || {};
+                if (typeof st.gamutAutoL === 'boolean') setGamutAutoL(st.gamutAutoL);
+                if (isFinite(st.gamutColorL)) setGamutColorL(Number(st.gamutColorL));
+                if (isFinite(st.gamutOpacity)) setGamutOpacity(Number(st.gamutOpacity));
+                if (typeof st.showLabels === 'boolean') setShowLabels(st.showLabels);
+                if (typeof st.viewMode === 'string') setViewMode(st.viewMode);
+                if (isFinite(st.camRoiPct)) { try { localStorage.setItem('lab_camRoiPct', String(st.camRoiPct)); } catch (err) {} }
+                alert(`Restored: ${nb.length} Base, ${nh.length} History, ${nt.length} Test points and settings.`);
+            } catch (err) {
+                console.error(err);
+                alert('Failed to read JSON file. Please choose a backup exported by this app.');
+            }
+            if (jsonInputRef.current) jsonInputRef.current.value = '';
+        };
+        reader.readAsText(file);
+    };
+
     // Process test points to add DeltaE and Gamut Delta info
     const processedTestPoints = testPoints.map(p => { 
         let processed = { ...p };
@@ -1241,6 +1290,7 @@ function App() {
 
     return (
         <div className="fixed inset-0 flex flex-col md:flex-row w-full h-full bg-[#1e1e24] md:bg-slate-50 font-sans text-gray-800 overflow-hidden" style={{ paddingTop: 'env(safe-area-inset-top)', paddingLeft: 'env(safe-area-inset-left)', paddingRight: 'env(safe-area-inset-right)' }}>
+            <input type="file" ref={jsonInputRef} onChange={handleJsonImport} accept=".json,application/json" className="hidden" />
             {showCamera && <CameraPicker onCapture={addFromCamera} onClose={() => setShowCamera(false)} />}
             <input type="file" ref={fileInputRef} onChange={handleExcelImport} accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" className="hidden" />
             {/* 材質欄位的輸入建議：列出已輸入過的材質 */}
@@ -1260,7 +1310,9 @@ function App() {
                     <div className="flex items-center gap-2"><div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold shadow-blue-200 shadow-lg">Lab</div><h1 className="text-lg font-bold text-gray-800">Gamut Simulator</h1></div>
                     <div className="flex gap-2">
                         <button onClick={triggerExcelInput} className="p-2.5 md:p-2 text-gray-400 hover:text-green-600 hover:bg-green-50 rounded-full transition-all" title="Import Excel"><FileSpreadsheet size={18} /></button>
-                        <button onClick={handleExcelExport} className="p-2.5 md:p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-all" title="Export Excel"><Download size={18} /></button>
+                        <button onClick={handleExcelExport} className="p-2.5 md:p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-all" title="Export Excel (.xlsx: Name, Material, L, a, b)"><Download size={18} /></button>
+                        <button onClick={handleJsonExport} className="p-2.5 md:p-2 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" title="Export all data & settings (.json)"><FileDown size={18} /></button>
+                        <button onClick={() => jsonInputRef.current && jsonInputRef.current.click()} className="p-2.5 md:p-2 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" title="Import backup (.json)"><FileUp size={18} /></button>
                         <button onClick={reset} className="p-2.5 md:p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-all" title="Reset"><RotateCcw size={18} /></button>
                     </div>
                 </div>
