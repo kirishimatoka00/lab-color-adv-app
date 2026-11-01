@@ -1180,7 +1180,7 @@ const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorCl
                 const f = (v) => (v > 0 ? '+' : '') + v.toFixed(1);
                 const row = (label, hint, r, accent) => (
                     <div className="border-t border-slate-100 pt-1 mt-1">
-                        <div className="flex items-center justify-between text-slate-400"><span className="font-bold" style={{ color: accent }}>{label}</span><span>{hint}</span></div>
+                        <div className="flex items-center justify-between text-slate-400"><span className="font-bold flex items-center gap-1.5" style={{ color: accent }}><span className="inline-block w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: accent }} />{label}</span><span>{hint}</span></div>
                         {r ? (
                             <div className="text-slate-700">
                                 <div className="flex justify-between font-bold">
@@ -1207,8 +1207,8 @@ const InputRow = ({ point, onChange, onDelete, isTestPoint = false, inputColorCl
                             <div className="flex flex-col w-full">
                                 <span className="font-bold text-orange-600 flex items-center gap-1"><CornerRightDown size={10}/> Out of Gamut — Correction A / B / C</span>
                                 {row('A', 'Chroma 維持・調整 Hue', g.A, '#f97316')}
-                                {row('B', 'Hue 維持・降低 Chroma', g.B, '#06b6d4')}
-                                {row('C 建議', '最小 ΔE（最近點）', g.C, '#16a34a')}
+                                {row('B', 'Hue 維持・降低 Chroma', g.B, '#22d3ee')}
+                                {row('C 建議', '最小 ΔE（最近點）', g.C, '#4ade80')}
                             </div>
                         )}
                     </div>
